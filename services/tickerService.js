@@ -3,7 +3,7 @@ import ActiveTrade from '../models/activeTradeModel.js';
 import { executeMarginSafeExit } from './orderService.js';
 
 let ticker = null;
-const lastPrices = {}; 
+export const lastPrices = {}; 
 
 export const startTicker = async () => {
     const kc = getKiteInstance();

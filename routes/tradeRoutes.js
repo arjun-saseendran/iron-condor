@@ -1,5 +1,5 @@
 import express from 'express';
-import { autoFetchAndCalculate } from '../services/orderMonitorService.js';
+import { autoFetchAndCalculate } from '../services/orderMoniterService.js';
 import ActiveTrade from '../models/activeTradeModel.js';
 import { lastPrices } from '../services/tickerService.js';
 

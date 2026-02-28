@@ -7,7 +7,8 @@ dotenv.config();
 
 // Initialize the Kite Connect instance
 const kc = new KiteConnect({
-  api_key: process.env.KITE_API_KEY
+  api_key: process.env.KITE_API_KEY,
+  redirect_uri: process.env.KITE_REDIRECT_URL
 });
 
 // We will save the token to a file named 'kite_token.txt' in your root folder

@@ -7,7 +7,7 @@ dotenv.config();
 const router = express.Router();
 
 // Step 1: Redirect to Kite Login URL
-router.get('/zerodha/login', (req, res) => {
+router.get('/login', (req, res) => {
   const kc = getKiteInstance();
   const loginUrl = kc.getLoginURL();
   res.redirect(loginUrl);

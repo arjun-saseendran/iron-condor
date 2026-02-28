@@ -14,7 +14,7 @@ router.get('/login', (req, res) => {
 });
 
 // Step 2: Handle the callback from Kite and generate the session
-router.get('/zerodha/callback', async (req, res) => {
+router.get('/callback', async (req, res) => {
   const requestToken = req.query.request_token;
   
   if (!requestToken) {

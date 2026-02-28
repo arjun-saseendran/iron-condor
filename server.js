@@ -27,7 +27,7 @@ app.use(express.json()); // MUST be above routes to parse req.body
 // ==========================================
 // API ROUTE MOUNTING
 // ==========================================
-app.use('/api/auth/zerodha', authRoutes);     
+app.use('/api/auth', authRoutes);     
 app.use('/api/trades', tradeRoutes);  
 
 const PORT = process.env.PORT || 5000;

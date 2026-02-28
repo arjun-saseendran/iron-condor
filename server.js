@@ -27,12 +27,31 @@ app.use(express.json()); // MUST be above routes to parse req.body
 // ==========================================
 // API ROUTE MOUNTING
 // ==========================================
+<<<<<<< HEAD
 app.use('/api/auth', authRoutes);     
 app.use('/api/login', authRoutes);     
+=======
+app.use('/api/auth/zerodha', authRoutes);     
+>>>>>>> c3fd87d (fix path)
 app.use('/api/trades', tradeRoutes);  
 
 const PORT = process.env.PORT || 3000;
 
+// ==========================================
+// 1-CLICK LOGIN REDIRECT
+// ==========================================
+app.get('/', (req, res) => {
+  const apiKey = process.env.KITE_API_KEY; 
+  if (!apiKey) {
+    return res.status(500).send("Please add KITE_API_KEY to your .env file!");
+  }
+  const loginUrl = `https://kite.zerodha.com/connect/login?v=3&api_key=${apiKey}`;
+  res.redirect(loginUrl);
+});
+
+// ==========================================
+// HEALTH CHECK
+// ==========================================
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'Trading Engine is online.' });
 });

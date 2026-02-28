@@ -16,25 +16,21 @@ connectDB();
 const app = express();
 const httpServer = createServer(app);
 
-// Initialize Socket.io
 initSocket(httpServer);
 
-// ==========================================
-// MIDDLEWARE (CRITICAL ORDER)
-// ==========================================
-app.use(express.json()); // MUST be above routes to parse req.body
+app.use(express.json()); 
 
 // ==========================================
-// API ROUTE MOUNTING
+// FIXED: API ROUTE MOUNTING
 // ==========================================
-app.use('/api/auth', authRoutes);     
+// Mounting at /api/auth/zerodha means all auth routes start here
+app.use('/api/auth/zerodha', authRoutes);     
 app.use('/api/trades', tradeRoutes);  
 
+// Set to Port 5000 for Iron Condor
 const PORT = process.env.PORT || 5000;
 
-// ==========================================
 // 1-CLICK LOGIN REDIRECT
-// ==========================================
 app.get('/', (req, res) => {
   const apiKey = process.env.KITE_API_KEY; 
   if (!apiKey) {
@@ -44,9 +40,6 @@ app.get('/', (req, res) => {
   res.redirect(loginUrl);
 });
 
-// ==========================================
-// HEALTH CHECK
-// ==========================================
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'Trading Engine is online.' });
 });

@@ -1,16 +1,19 @@
+import { KiteTicker } from 'kiteconnect'; // ⬅️ NEW: Using the specific Ticker constructor
 import { getKiteInstance } from './kiteService.js';
 import ActiveTrade from '../models/activeTradeModel.js';
 import { sendTelegramAlert } from './telegramService.js';
 
-export let lastPrices = {}; // Global store for live prices
+export let lastPrices = {}; 
 
-/**
- * The Ticker Engine
- * Connects to Zerodha WebSockets and monitors risk in real-time.
- */
 export const initTicker = async () => {
     const kc = getKiteInstance();
-    const ticker = kc.ticker();
+    
+    // 🛠️ FIX: Initialize the Ticker using the constructor
+    // You need the API Key and the Access Token (which is kc.access_token)
+    const ticker = new KiteTicker({
+        api_key: kc.api_key,
+        access_token: kc.access_token
+    });
 
     ticker.connect();
 
@@ -25,7 +28,7 @@ export const initTicker = async () => {
                 activeTrade.tokens.callBuy,
                 activeTrade.tokens.putSell,
                 activeTrade.tokens.putBuy
-            ].filter(t => t); // Filter out nulls for 2-leg spreads
+            ].filter(t => t); 
 
             ticker.subscribe(tokens);
             ticker.setMode(ticker.modeFull, tokens);
@@ -33,44 +36,36 @@ export const initTicker = async () => {
     });
 
     ticker.on("ticks", async (ticks) => {
-        // 1. Update our local price store
         ticks.forEach(tick => {
             lastPrices[tick.instrument_token] = tick.last_price;
         });
 
-        // 2. Perform Risk Check
         const activeTrade = await ActiveTrade.findOne({ status: 'ACTIVE' });
         if (!activeTrade) return;
 
         const { tokens, callSpreadEntryPremium, putSpreadEntryPremium, totalEntryPremium, bufferPremium, isIronButterfly, tradeType } = activeTrade;
 
-        // Calculate Current Spread Values (LTP Sell - LTP Buy)
         const currentCallNet = tokens.callSell ? Math.abs((lastPrices[tokens.callSell] || 0) - (lastPrices[tokens.callBuy] || 0)) : 0;
         const currentPutNet = tokens.putSell ? Math.abs((lastPrices[tokens.putSell] || 0) - (lastPrices[tokens.putBuy] || 0)) : 0;
 
-        // ---------------------------------------------------------
-        // LOGIC 1: 70% DECAY ALERTS (Time to book profits/Roll)
-        // ---------------------------------------------------------
+        // --- 70% DECAY ALERTS ---
         if (!activeTrade.alertsSent.call70Decay && tradeType !== 'PUT_SPREAD' && currentCallNet <= (callSpreadEntryPremium * 0.3)) {
-            sendTelegramAlert(`🟢 <b>70% DECAY: ${activeTrade.index} CALL</b>\n\nEntry: ₹${callSpreadEntryPremium.toFixed(2)}\nCurrent: ₹${currentCallNet.toFixed(2)}\n\n<i>You can now roll or book profit.</i>`);
+            sendTelegramAlert(`🟢 <b>70% DECAY: ${activeTrade.index} CALL</b>\nEntry: ₹${callSpreadEntryPremium.toFixed(2)}\nCurrent: ₹${currentCallNet.toFixed(2)}`);
             activeTrade.alertsSent.call70Decay = true;
             await activeTrade.save();
         }
 
         if (!activeTrade.alertsSent.put70Decay && tradeType !== 'CALL_SPREAD' && currentPutNet <= (putSpreadEntryPremium * 0.3)) {
-            sendTelegramAlert(`🟢 <b>70% DECAY: ${activeTrade.index} PUT</b>\n\nEntry: ₹${putSpreadEntryPremium.toFixed(2)}\nCurrent: ₹${currentPutNet.toFixed(2)}\n\n<i>You can now roll or book profit.</i>`);
+            sendTelegramAlert(`🟢 <b>70% DECAY: ${activeTrade.index} PUT</b>\nEntry: ₹${putSpreadEntryPremium.toFixed(2)}\nCurrent: ₹${currentPutNet.toFixed(2)}`);
             activeTrade.alertsSent.put70Decay = true;
             await activeTrade.save();
         }
 
-        // ---------------------------------------------------------
-        // LOGIC 2: STOP LOSS MONITORING
-        // ---------------------------------------------------------
+        // --- STOP LOSS LOGIC ---
         let triggerExit = false;
         let exitReason = "";
 
         if (isIronButterfly) {
-            // Global 2% Rule for Iron Butterfly
             const maxLossLimit = totalEntryPremium * 2; 
             const currentTotalValue = currentCallNet + currentPutNet;
             if (currentTotalValue >= maxLossLimit) {
@@ -78,7 +73,6 @@ export const initTicker = async () => {
                 exitReason = `Iron Butterfly Global SL Hit (Value: ₹${currentTotalValue.toFixed(2)})`;
             }
         } else {
-            // Individual 4x SL Rule + Buffer
             const callSL = (callSpreadEntryPremium * 4) + bufferPremium;
             const putSL = (putSpreadEntryPremium * 4) + bufferPremium;
 
@@ -91,34 +85,27 @@ export const initTicker = async () => {
             }
         }
 
-        // ---------------------------------------------------------
-        // LOGIC 3: EXECUTE AUTO-EXIT
-        // ---------------------------------------------------------
         if (triggerExit && activeTrade.status === 'ACTIVE') {
             activeTrade.status = 'EXITING';
             await activeTrade.save();
-
-            console.error(`🚨 STOP LOSS TRIGGERED: ${exitReason}`);
-            sendTelegramAlert(`🚨 <b>STOP LOSS HIT: ${activeTrade.index}</b>\n\nReason: ${exitReason}\n\n<i>Bot is firing market exit orders now!</i>`);
-
+            sendTelegramAlert(`🚨 <b>STOP LOSS HIT: ${activeTrade.index}</b>\nReason: ${exitReason}`);
             await executeMarketExit(activeTrade);
         }
     });
+
+    ticker.on("error", (err) => console.error("❌ Ticker Error:", err));
+    ticker.on("close", (reason) => console.warn("📡 Ticker Connection Closed:", reason));
 };
 
-/**
- * Fires Market Orders to close all legs of the spread
- */
 const executeMarketExit = async (trade) => {
     const kc = getKiteInstance();
     try {
-        // Exit strategy: Buy back the shorts, sell the longs (Market Orders)
         const legs = [
             { symbol: trade.symbols.callSell, type: "BUY" },
             { symbol: trade.symbols.callBuy, type: "SELL" },
             { symbol: trade.symbols.putSell, type: "BUY" },
             { symbol: trade.symbols.putBuy, type: "SELL" }
-        ].filter(leg => leg.symbol); // Only exit legs that actually exist
+        ].filter(leg => leg.symbol);
 
         for (const leg of legs) {
             await kc.placeOrder("regular", {
@@ -133,11 +120,10 @@ const executeMarketExit = async (trade) => {
 
         trade.status = 'EXITED';
         await trade.save();
-        sendTelegramAlert(`✅ <b>Exit Complete: ${trade.index}</b>\nAll legs closed at market price.`);
-        
+        sendTelegramAlert(`✅ <b>Exit Complete: ${trade.index}</b>`);
     } catch (err) {
         trade.status = 'FAILED_EXIT';
         await trade.save();
-        sendTelegramAlert(`❌ <b>CRITICAL: Exit Failed</b>\nError: ${err.message}\n<i>Please check Zerodha manually immediately!</i>`);
+        sendTelegramAlert(`❌ <b>CRITICAL: Exit Failed</b>\nError: ${err.message}`);
     }
 };

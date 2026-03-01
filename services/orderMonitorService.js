@@ -1,6 +1,12 @@
 import { getKiteInstance } from './kiteService.js';
 import ActiveTrade from '../models/activeTradeModel.js';
+import { sendTelegramAlert } from './telegramService.js';
 
+/**
+ * Determines which index is active based on the day of the week.
+ * NIFTY: Monday, Tuesday
+ * SENSEX: Wednesday, Thursday
+ */
 const getActiveIndexForToday = () => {
     const day = new Date().getDay();
     if (day === 1 || day === 2) return 'NIFTY';
@@ -8,6 +14,10 @@ const getActiveIndexForToday = () => {
     return null; 
 };
 
+/**
+ * Scans the Kite Order Book to detect new entries or manual firefight rolls.
+ * Dynamically adjusts SL buffers based on booked profits.
+ */
 export const scanAndSyncOrders = async () => {
     const index = getActiveIndexForToday();
     if (!index) return;
@@ -15,15 +25,19 @@ export const scanAndSyncOrders = async () => {
     const kc = getKiteInstance();
     try {
         const orders = await kc.getOrders();
-        const todayCompletedOrders = orders.filter(o => o.status === 'COMPLETE' && o.tradingsymbol.startsWith(index));
+        // Only look at completed orders for today's active index
+        const todayCompletedOrders = orders.filter(o => 
+            o.status === 'COMPLETE' && 
+            o.tradingsymbol.startsWith(index)
+        );
 
         let activeTrade = await ActiveTrade.findOne({ index, status: 'ACTIVE' });
 
-        // ==========================================
-        // SCENARIO A: ROLLING (Firefight OR Trending)
-        // ==========================================
+        // ====================================================================
+        // SCENARIO A: ROLLING (Firefight or Trending Profit Booking)
+        // ====================================================================
         if (activeTrade) {
-            // Find orders that DO NOT match our currently saved active symbols
+            // Find orders that are NOT currently being monitored (indicating a roll)
             const newOrders = todayCompletedOrders.filter(o => 
                 o.tradingsymbol !== activeTrade.symbols.callSell &&
                 o.tradingsymbol !== activeTrade.symbols.callBuy &&
@@ -35,13 +49,23 @@ export const scanAndSyncOrders = async () => {
 
             let callRolled = false;
             let putRolled = false;
+            let callBooked = 0;
+            let putBooked = 0;
             const newLegs = { callSell: null, callBuy: null, putSell: null, putBuy: null };
 
             newOrders.forEach(order => {
                 const isCall = order.tradingsymbol.endsWith('CE');
                 const isSell = order.transaction_type === 'SELL';
-                const strike = parseInt(order.tradingsymbol.match(/\d{5,6}/)[0]);
-                const legData = { symbol: order.tradingsymbol, price: order.average_price, token: order.instrument_token, strike };
+                // Extract strike price from symbol (e.g., NIFTY26MAR23500CE -> 23500)
+                const strikeMatch = order.tradingsymbol.match(/\d{5,6}/);
+                const strike = strikeMatch ? parseInt(strikeMatch[0]) : 0;
+                
+                const legData = { 
+                    symbol: order.tradingsymbol, 
+                    price: order.average_price, 
+                    token: order.instrument_token, 
+                    strike 
+                };
 
                 if (isCall && isSell) { newLegs.callSell = legData; callRolled = true; }
                 if (isCall && !isSell) newLegs.callBuy = legData;
@@ -49,10 +73,12 @@ export const scanAndSyncOrders = async () => {
                 if (!isCall && !isSell) newLegs.putBuy = legData;
             });
 
-            // TRENDING OR FIREFIGHT ROLL: Call Side
+            // Handle Call Side Roll (Trending profit booking or Firefight)
             if (callRolled && newLegs.callSell && newLegs.callBuy) {
-                console.log("🔥 CALL ROLL DETECTED: Booking profit/loss into buffer...");
-                activeTrade.bufferPremium += (activeTrade.callSpreadEntryPremium * 0.7); 
+                // Buffer = 70% of the premium from the side we just exited
+                callBooked = (activeTrade.callSpreadEntryPremium * 0.7);
+                activeTrade.bufferPremium += callBooked; 
+                
                 activeTrade.callSpreadEntryPremium = newLegs.callSell.price - newLegs.callBuy.price;
                 activeTrade.callSellStrike = newLegs.callSell.strike;
                 activeTrade.symbols.callSell = newLegs.callSell.symbol;
@@ -61,10 +87,11 @@ export const scanAndSyncOrders = async () => {
                 activeTrade.tokens.callBuy = newLegs.callBuy.token;
             }
 
-            // TRENDING OR FIREFIGHT ROLL: Put Side
+            // Handle Put Side Roll (Trending profit booking or Firefight)
             if (putRolled && newLegs.putSell && newLegs.putBuy) {
-                console.log("🔥 PUT ROLL DETECTED: Booking profit/loss into buffer...");
-                activeTrade.bufferPremium += (activeTrade.putSpreadEntryPremium * 0.7); 
+                putBooked = (activeTrade.putSpreadEntryPremium * 0.7);
+                activeTrade.bufferPremium += putBooked; 
+                
                 activeTrade.putSpreadEntryPremium = newLegs.putSell.price - newLegs.putBuy.price;
                 activeTrade.putSellStrike = newLegs.putSell.strike;
                 activeTrade.symbols.putSell = newLegs.putSell.symbol;
@@ -74,25 +101,40 @@ export const scanAndSyncOrders = async () => {
             }
 
             if (callRolled || putRolled) {
+                // Update trade state
                 activeTrade.totalEntryPremium = activeTrade.callSpreadEntryPremium + activeTrade.putSpreadEntryPremium;
                 activeTrade.alertsSent = { call70Decay: false, put70Decay: false, firefightAlert: false };
-                activeTrade.isIronButterfly = false; 
+                activeTrade.isIronButterfly = false; // Reset IB check after a roll
+                
                 await activeTrade.save();
+                
+                // 📱 TELEGRAM NOTIFICATION
+                const rollSide = (callRolled && putRolled) ? "Call & Put" : callRolled ? "Call" : "Put";
+                const totalAdded = (callBooked + putBooked).toFixed(2);
+                
+                sendTelegramAlert(
+                    `🔄 <b>Trade Roll Detected: ${index}</b>\n\n` +
+                    `Side: <b>${rollSide}</b>\n` +
+                    `Profit Booked to Buffer: ₹${totalAdded}\n` +
+                    `New Total SL Buffer: ₹${activeTrade.bufferPremium.toFixed(2)}\n\n` +
+                    `<i>Stop Loss limits have been expanded.</i>`
+                );
                 console.log(`✅ Trade Rolled. New Total Buffer: ${activeTrade.bufferPremium.toFixed(2)}`);
             }
         } 
-        // ==========================================
-        // SCENARIO B: BRAND NEW DAY 1 ENTRY (2-Leg or 4-Leg)
-        // ==========================================
+        // ====================================================================
+        // SCENARIO B: BRAND NEW ENTRY (Supports 2-Leg or 4-Leg)
+        // ====================================================================
         else {
             if (todayCompletedOrders.length < 2) return; 
 
-            // Scan backwards to find the most recent opening legs
+            // Find the most recent opening legs for CE and PE spreads
             let ceSell, ceBuy, peSell, peBuy;
             for (let i = todayCompletedOrders.length - 1; i >= 0; i--) {
                 const o = todayCompletedOrders[i];
                 const isCall = o.tradingsymbol.endsWith('CE');
                 const isSell = o.transaction_type === 'SELL';
+                
                 if (isCall && isSell && !ceSell) ceSell = o;
                 if (isCall && !isSell && !ceBuy) ceBuy = o;
                 if (!isCall && isSell && !peSell) peSell = o;
@@ -113,14 +155,17 @@ export const scanAndSyncOrders = async () => {
                 tradeType = 'PUT_SPREAD';
                 putNet = peSell.average_price - peBuy.average_price;
             } else {
-                return; // Incomplete spread, waiting for execution
+                return; // Not a complete spread yet
             }
 
-            const spotToken = index === 'SENSEX' ? 265 : 256265;
-            const lotSize = index === 'NIFTY' ? parseInt(process.env.NIFTY_LOT_SIZE) : parseInt(process.env.SENSEX_LOT_SIZE);
+            const spotToken = (index === 'SENSEX') ? 265 : 256265;
+            const lotSize = (index === 'NIFTY') 
+                ? parseInt(process.env.NIFTY_LOT_SIZE) 
+                : parseInt(process.env.SENSEX_LOT_SIZE);
 
-            console.log(`🆕 New ${index} ${tradeType} Detected! Saving fresh entry.`);
-            await ActiveTrade.create({
+            console.log(`🆕 New ${index} ${tradeType} Detected! Saving to database.`);
+            
+            const newTrade = await ActiveTrade.create({
                 index,
                 tradeType,
                 lotSize,
@@ -144,6 +189,14 @@ export const scanAndSyncOrders = async () => {
                     putBuy: peBuy ? peBuy.instrument_token : null
                 }
             });
+
+            // 📱 TELEGRAM NOTIFICATION
+            sendTelegramAlert(
+                `🆕 <b>New ${index} Entry Tracked</b>\n` +
+                `Strategy: <b>${tradeType.replace('_', ' ')}</b>\n` +
+                `Total Premium: ₹${(callNet + putNet).toFixed(2)}\n\n` +
+                `<i>Bot is now monitoring ticks for 4x SL breach.</i>`
+            );
         }
     } catch (err) {
         console.error("❌ Order Monitor Error:", err.message);

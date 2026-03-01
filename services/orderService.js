@@ -1,40 +1,43 @@
 import { getKiteInstance } from './kiteService.js';
 
-export const executeMarginSafeExit = async (sellSymbol, buySymbol, exchange, index) => {
+export const executeMarginSafeExit = async (sellSymbol, buySymbol, totalQuantity, index) => {
     const kc = getKiteInstance();
-    // Defaulting to 5 lots as per your user summary
-    const quantity = index === 'NIFTY' ? (65 * 5) : (20 * 5); 
+    
+    // NIFTY uses NFO (NSE Futures & Options), SENSEX uses BFO (BSE Futures & Options)
+    const exchange = index === 'SENSEX' ? 'BFO' : 'NFO';
 
-    console.log(`🚨 [ORDER SERVICE] Executing Margin-Safe Exit for ${index}`);
+    console.log(`🚨 [EXECUTION] Margin-Safe Exit Triggered for ${index}`);
+    console.log(`📊 Quantity: ${totalQuantity} | Exchange: ${exchange}`);
 
     try {
-        // STEP 1: EXIT SELL LEG (The Short) - Most important for margin
-        console.log(`⏳ Closing Short Leg: ${sellSymbol}...`);
+        // STEP 1: EXIT SHORT LEG FIRST (Buy to Cover)
+        // This is critical. If you sell the long leg first, your margin shoots up and the broker might reject the order.
+        console.log(`⏳ Closing Short Leg (Buying): ${sellSymbol}...`);
         const sellExit = await kc.placeOrder("regular", {
             exchange: exchange,
             tradingsymbol: sellSymbol,
-            transaction_type: "BUY",
-            quantity: quantity,
+            transaction_type: "BUY", // We are BUYING back the option we sold
+            quantity: totalQuantity,
             order_type: "MARKET",
             product: "NRML"
         });
-        console.log(`✅ Short Leg Closed. ID: ${sellExit.order_id}`);
+        console.log(`✅ Short Leg Closed. Order ID: ${sellExit.order_id}`);
 
-        // STEP 2: EXIT BUY LEG (The Hedge)
-        console.log(`⏳ Closing Long Leg: ${buySymbol}...`);
+        // STEP 2: EXIT LONG LEG SECOND (Sell to Close)
+        console.log(`⏳ Closing Long Leg (Selling): ${buySymbol}...`);
         const buyExit = await kc.placeOrder("regular", {
             exchange: exchange,
             tradingsymbol: buySymbol,
-            transaction_type: "SELL",
-            quantity: quantity,
+            transaction_type: "SELL", // We are SELLING the option we bought
+            quantity: totalQuantity,
             order_type: "MARKET",
             product: "NRML"
         });
-        console.log(`✅ Long Leg Closed. ID: ${buyExit.order_id}`);
+        console.log(`✅ Long Leg Closed. Order ID: ${buyExit.order_id}`);
 
         return { sellExit, buyExit };
     } catch (error) {
-        console.error('❌ CRITICAL: Order Execution Failed!', error.message);
+        console.error('❌ CRITICAL ORDER FAILURE:', error.message);
         throw error;
     }
 };

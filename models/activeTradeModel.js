@@ -7,12 +7,29 @@ const activeTradeSchema = new mongoose.Schema({
     default: 'ACTIVE', 
     enum: ['ACTIVE', 'MANUAL_OVERRIDE', 'EXITING', 'EXITED', 'FAILED_EXIT'] 
   },
-  callSellStrike: { type: Number, required: true }, // The strike the bot watches for Killswitch
-  putSellStrike: { type: Number, required: true },  // The strike the bot watches for Killswitch
+  
+  // --- NEW DYNAMIC STATE VARIABLES ---
+  isIronButterfly: { type: Boolean, default: false }, // Triggers the 2% SL logic instead of 4x
+  bufferPremium: { type: Number, default: 0 }, // Accumulated profit from previous firefight rolls
+  lotSize: { type: Number, required: true }, // Loaded dynamically from .env
+  
+  // --- STRIKES (For ATM Detection) ---
+  callSellStrike: { type: Number, required: true },
+  putSellStrike: { type: Number, required: true },
+  
+  // --- PREMIUMS ---
   callSpreadEntryPremium: { type: Number, required: true },
   putSpreadEntryPremium: { type: Number, required: true },
-  bookedCallPremium: { type: Number, default: 0 },
-  bookedPutPremium: { type: Number, default: 0 },
+  totalEntryPremium: { type: Number, required: true }, // Used for the Iron Butterfly 2% calculation
+  
+  // --- ALERT TRACKERS (Prevents spamming) ---
+  alertsSent: {
+    call70Decay: { type: Boolean, default: false },
+    put70Decay: { type: Boolean, default: false },
+    firefightAlert: { type: Boolean, default: false }
+  },
+
+  // --- KITE SYMBOLS & TOKENS ---
   symbols: {
     callSell: { type: String, required: true },
     callBuy: { type: String, required: true },

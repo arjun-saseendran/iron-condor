@@ -13,7 +13,14 @@ const app = express();
 
 // --- MIDDLEWARE ---
 app.use(express.json());
-app.use(cors()); // Critical for the React Frontend later!
+const corsOptions = {
+    origin: 'https://mariaalgo.online',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'Origin'],
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 // --- DATABASE ---
 connectDB();

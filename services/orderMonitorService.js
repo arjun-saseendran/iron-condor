@@ -20,11 +20,10 @@ export const scanAndSyncOrders = async () => {
         let activeTrade = await ActiveTrade.findOne({ index, status: 'ACTIVE' });
 
         // ==========================================
-        // SCENARIO A: DAY 2 PARTIAL ROLL (FIREFIGHT)
+        // SCENARIO A: ROLLING (Firefight OR Trending)
         // ==========================================
         if (activeTrade) {
             // Find orders that DO NOT match our currently saved active symbols
-            // This isolates the brand new legs you just opened today
             const newOrders = todayCompletedOrders.filter(o => 
                 o.tradingsymbol !== activeTrade.symbols.callSell &&
                 o.tradingsymbol !== activeTrade.symbols.callBuy &&
@@ -32,13 +31,12 @@ export const scanAndSyncOrders = async () => {
                 o.tradingsymbol !== activeTrade.symbols.putBuy
             );
 
-            if (newOrders.length === 0) return; // No new firefights detected today
+            if (newOrders.length === 0) return; 
 
             let callRolled = false;
             let putRolled = false;
             const newLegs = { callSell: null, callBuy: null, putSell: null, putBuy: null };
 
-            // Categorize the newly discovered orders
             newOrders.forEach(order => {
                 const isCall = order.tradingsymbol.endsWith('CE');
                 const isSell = order.transaction_type === 'SELL';
@@ -51,10 +49,10 @@ export const scanAndSyncOrders = async () => {
                 if (!isCall && !isSell) newLegs.putBuy = legData;
             });
 
-            // If we rolled the CALL side
+            // TRENDING OR FIREFIGHT ROLL: Call Side
             if (callRolled && newLegs.callSell && newLegs.callBuy) {
-                console.log("🔥 CALL FIREFIGHT DETECTED: Updating Call side buffer...");
-                activeTrade.bufferPremium += (activeTrade.callSpreadEntryPremium * 0.7); // Add 70% of old premium to buffer
+                console.log("🔥 CALL ROLL DETECTED: Booking profit/loss into buffer...");
+                activeTrade.bufferPremium += (activeTrade.callSpreadEntryPremium * 0.7); 
                 activeTrade.callSpreadEntryPremium = newLegs.callSell.price - newLegs.callBuy.price;
                 activeTrade.callSellStrike = newLegs.callSell.strike;
                 activeTrade.symbols.callSell = newLegs.callSell.symbol;
@@ -63,10 +61,10 @@ export const scanAndSyncOrders = async () => {
                 activeTrade.tokens.callBuy = newLegs.callBuy.token;
             }
 
-            // If we rolled the PUT side
+            // TRENDING OR FIREFIGHT ROLL: Put Side
             if (putRolled && newLegs.putSell && newLegs.putBuy) {
-                console.log("🔥 PUT FIREFIGHT DETECTED: Updating Put side buffer...");
-                activeTrade.bufferPremium += (activeTrade.putSpreadEntryPremium * 0.7); // Add 70% of old premium to buffer
+                console.log("🔥 PUT ROLL DETECTED: Booking profit/loss into buffer...");
+                activeTrade.bufferPremium += (activeTrade.putSpreadEntryPremium * 0.7); 
                 activeTrade.putSpreadEntryPremium = newLegs.putSell.price - newLegs.putBuy.price;
                 activeTrade.putSellStrike = newLegs.putSell.strike;
                 activeTrade.symbols.putSell = newLegs.putSell.symbol;
@@ -78,58 +76,72 @@ export const scanAndSyncOrders = async () => {
             if (callRolled || putRolled) {
                 activeTrade.totalEntryPremium = activeTrade.callSpreadEntryPremium + activeTrade.putSpreadEntryPremium;
                 activeTrade.alertsSent = { call70Decay: false, put70Decay: false, firefightAlert: false };
-                activeTrade.isIronButterfly = false; // Reset IB status on a roll
+                activeTrade.isIronButterfly = false; 
                 await activeTrade.save();
                 console.log(`✅ Trade Rolled. New Total Buffer: ${activeTrade.bufferPremium.toFixed(2)}`);
             }
-
         } 
         // ==========================================
-        // SCENARIO B: BRAND NEW DAY 1 ENTRY
+        // SCENARIO B: BRAND NEW DAY 1 ENTRY (2-Leg or 4-Leg)
         // ==========================================
         else {
-            if (todayCompletedOrders.length < 4) return; 
+            if (todayCompletedOrders.length < 2) return; 
 
-            // Grab the last 4 orders assuming it's a fresh 4-leg entry
-            const recent4 = todayCompletedOrders.slice(-4);
-            const legs = { callSell: null, callBuy: null, putSell: null, putBuy: null };
+            // Scan backwards to find the most recent opening legs
+            let ceSell, ceBuy, peSell, peBuy;
+            for (let i = todayCompletedOrders.length - 1; i >= 0; i--) {
+                const o = todayCompletedOrders[i];
+                const isCall = o.tradingsymbol.endsWith('CE');
+                const isSell = o.transaction_type === 'SELL';
+                if (isCall && isSell && !ceSell) ceSell = o;
+                if (isCall && !isSell && !ceBuy) ceBuy = o;
+                if (!isCall && isSell && !peSell) peSell = o;
+                if (!isCall && !isSell && !peBuy) peBuy = o;
+            }
 
-            recent4.forEach(order => {
-                const isCall = order.tradingsymbol.endsWith('CE');
-                const isSell = order.transaction_type === 'SELL';
-                const strikeMatch = order.tradingsymbol.match(/\d{5,6}/);
-                const strike = strikeMatch ? parseInt(strikeMatch[0]) : 0;
-                const legData = { symbol: order.tradingsymbol, price: order.average_price, token: order.instrument_token, strike };
+            let tradeType = null;
+            let callNet = 0, putNet = 0;
 
-                if (isCall && isSell) legs.callSell = legData;
-                else if (isCall && !isSell) legs.callBuy = legData;
-                else if (!isCall && isSell) legs.putSell = legData;
-                else if (!isCall && !isSell) legs.putBuy = legData;
-            });
+            if (ceSell && ceBuy && peSell && peBuy) {
+                tradeType = 'IRON_CONDOR';
+                callNet = ceSell.average_price - ceBuy.average_price;
+                putNet = peSell.average_price - peBuy.average_price;
+            } else if (ceSell && ceBuy) {
+                tradeType = 'CALL_SPREAD';
+                callNet = ceSell.average_price - ceBuy.average_price;
+            } else if (peSell && peBuy) {
+                tradeType = 'PUT_SPREAD';
+                putNet = peSell.average_price - peBuy.average_price;
+            } else {
+                return; // Incomplete spread, waiting for execution
+            }
 
-            if (!legs.callSell || !legs.callBuy || !legs.putSell || !legs.putBuy) return;
+            const spotToken = index === 'SENSEX' ? 265 : 256265;
+            const lotSize = index === 'NIFTY' ? parseInt(process.env.NIFTY_LOT_SIZE) : parseInt(process.env.SENSEX_LOT_SIZE);
 
-            const callNet = legs.callSell.price - legs.callBuy.price;
-            const putNet = legs.putSell.price - legs.putBuy.price;
-
-            console.log(`🆕 New ${index} Iron Condor Detected! Saving fresh entry.`);
+            console.log(`🆕 New ${index} ${tradeType} Detected! Saving fresh entry.`);
             await ActiveTrade.create({
                 index,
-                lotSize: index === 'NIFTY' ? parseInt(process.env.NIFTY_LOT_SIZE) : parseInt(process.env.SENSEX_LOT_SIZE),
+                tradeType,
+                lotSize,
                 callSpreadEntryPremium: callNet,
                 putSpreadEntryPremium: putNet,
                 totalEntryPremium: callNet + putNet,
                 bufferPremium: 0,
-                callSellStrike: legs.callSell.strike,
-                putSellStrike: legs.putSell.strike,
+                callSellStrike: ceSell ? parseInt(ceSell.tradingsymbol.match(/\d{5,6}/)[0]) : null,
+                putSellStrike: peSell ? parseInt(peSell.tradingsymbol.match(/\d{5,6}/)[0]) : null,
                 symbols: {
-                    callSell: legs.callSell.symbol, callBuy: legs.callBuy.symbol,
-                    putSell: legs.putSell.symbol, putBuy: legs.putBuy.symbol
+                    callSell: ceSell ? ceSell.tradingsymbol : null,
+                    callBuy: ceBuy ? ceBuy.tradingsymbol : null,
+                    putSell: peSell ? peSell.tradingsymbol : null,
+                    putBuy: peBuy ? peBuy.tradingsymbol : null
                 },
                 tokens: {
-                    spotIndex: index === 'SENSEX' ? 265 : 256265, // BSE Sensex or NSE Nifty 50
-                    callSell: legs.callSell.token, callBuy: legs.callBuy.token,
-                    putSell: legs.putSell.token, putBuy: legs.putBuy.token
+                    spotIndex: spotToken,
+                    callSell: ceSell ? ceSell.instrument_token : null,
+                    callBuy: ceBuy ? ceBuy.instrument_token : null,
+                    putSell: peSell ? peSell.instrument_token : null,
+                    putBuy: peBuy ? peBuy.instrument_token : null
                 }
             });
         }

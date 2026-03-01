@@ -8,21 +8,28 @@ const activeTradeSchema = new mongoose.Schema({
     enum: ['ACTIVE', 'MANUAL_OVERRIDE', 'EXITING', 'EXITED', 'FAILED_EXIT'] 
   },
   
-  // --- NEW DYNAMIC STATE VARIABLES ---
-  isIronButterfly: { type: Boolean, default: false }, // Triggers the 2% SL logic instead of 4x
-  bufferPremium: { type: Number, default: 0 }, // Accumulated profit from previous firefight rolls
-  lotSize: { type: Number, required: true }, // Loaded dynamically from .env
+  // --- NEW: Identifies if this is a 4-leg IC or a 2-leg directional spread ---
+  tradeType: { 
+    type: String, 
+    enum: ['IRON_CONDOR', 'CALL_SPREAD', 'PUT_SPREAD'], 
+    required: true 
+  },
   
-  // --- STRIKES (For ATM Detection) ---
-  callSellStrike: { type: Number, required: true },
-  putSellStrike: { type: Number, required: true },
+  // --- DYNAMIC STATE VARIABLES ---
+  isIronButterfly: { type: Boolean, default: false }, 
+  bufferPremium: { type: Number, default: 0 }, // Holds booked profits from trending rolls!
+  lotSize: { type: Number, required: true }, 
+  
+  // --- STRIKES (Required flags removed to allow 2-leg trades) ---
+  callSellStrike: { type: Number },
+  putSellStrike: { type: Number },
   
   // --- PREMIUMS ---
-  callSpreadEntryPremium: { type: Number, required: true },
-  putSpreadEntryPremium: { type: Number, required: true },
-  totalEntryPremium: { type: Number, required: true }, // Used for the Iron Butterfly 2% calculation
+  callSpreadEntryPremium: { type: Number, default: 0 },
+  putSpreadEntryPremium: { type: Number, default: 0 },
+  totalEntryPremium: { type: Number, required: true },
   
-  // --- ALERT TRACKERS (Prevents spamming) ---
+  // --- ALERT TRACKERS ---
   alertsSent: {
     call70Decay: { type: Boolean, default: false },
     put70Decay: { type: Boolean, default: false },
@@ -31,17 +38,17 @@ const activeTradeSchema = new mongoose.Schema({
 
   // --- KITE SYMBOLS & TOKENS ---
   symbols: {
-    callSell: { type: String, required: true },
-    callBuy: { type: String, required: true },
-    putSell: { type: String, required: true },
-    putBuy: { type: String, required: true }
+    callSell: { type: String },
+    callBuy: { type: String },
+    putSell: { type: String },
+    putBuy: { type: String }
   },
   tokens: {
     spotIndex: { type: Number, required: true },
-    callSell: { type: Number, required: true },
-    callBuy: { type: Number, required: true },
-    putSell: { type: Number, required: true },
-    putBuy: { type: Number, required: true }
+    callSell: { type: Number },
+    callBuy: { type: Number },
+    putSell: { type: Number },
+    putBuy: { type: Number }
   }
 }, { timestamps: true });
 

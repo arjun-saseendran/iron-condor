@@ -1,5 +1,5 @@
 import puppeteer from 'puppeteer';
-import { getKiteInstance, setAccessToken } from './kiteService.js';
+import { getKiteInstance, setAccessToken } from './services/kiteService.js';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { createHmac } from 'crypto';

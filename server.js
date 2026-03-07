@@ -7,7 +7,6 @@ import cron from "node-cron";
 
 // ─── Config & Routes ──────────────────────────────────────────────────────────
 import { connectDatabases }   from "./config/db.js";
-import authRoutes             from "./routes/authRoutes.js";
 import tradeRoutes            from "./routes/ironCondorTradeRoutes.js";
 import autoCondorRoutes       from "./routes/autoCondorRoutes.js";
 import optionsRoutes          from "./routes/optionChainRoutes.js";
@@ -59,7 +58,6 @@ setSocketIO(io);
 io.on("connection", (_socket) => {});
 
 // ─── API ROUTES ───────────────────────────────────────────────────────────────
-app.use("/api/auth",        authRoutes);
 app.use("/api/trades",      tradeRoutes);
 app.use("/api/options",     optionsRoutes);
 app.use("/api/positions",   positionRoutes);

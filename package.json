@@ -1,0 +1,30 @@
+{
+  "name": "iron-condor-server",
+  "version": "1.0.0",
+  "description": "Iron Condor algo trading server",
+  "author": "arjunsaseendran",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "login:kite": "node kiteAutoLogin.js",
+    "login:upstox": "node upstoxAutoLogin.js"
+  },
+  "dependencies": {
+    "axios": "^1.13.6",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "fyers-api-v3": "^1.6.0",
+    "kiteconnect": "^5.1.0",
+    "mongoose": "^9.2.2",
+    "node-cron": "^4.2.1",
+    "puppeteer": "^24.37.5",
+    "socket.io": "^4.8.3",
+    "upstox-js-sdk": "^2.21.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}

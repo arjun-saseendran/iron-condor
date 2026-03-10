@@ -69,7 +69,7 @@ app.get("/api/history", async (req, res) => {
   try {
     const { getCondorTradePerformanceModel } = await import("./models/condorTradePerformanceModel.js");
     const history = await getCondorTradePerformanceModel()
-      .find({ strategy: "IRON_CONDOR" })
+      .find({}) // ✅ FIX: strategy field is never set on CondorPerf records — removed filter
       .sort({ createdAt: -1 })
       .limit(50);
     res.json(history.map(h => ({
@@ -125,9 +125,13 @@ app.post("/api/trades/butterfly", async (req, res) => {
     const trade = await ActiveTrade.findOne({ status: "ACTIVE" });
     if (!trade) return res.status(404).json({ error: "No active trade" });
     if (!trade.butterflyPending) return res.status(400).json({ error: "No butterfly pending" });
+    // ✅ FIX: losingSide is stored in butterflySide field when butterflyPending is set.
+    //         convertToButterfly requires losingSide — without it, wrong side gets exited.
+    const losingSide = trade.butterflySide;
+    if (!losingSide) return res.status(400).json({ error: "butterflySide not set on trade — cannot convert" });
 
     const { convertToButterfly } = await import("./Engines/ironCondorEngine.js");
-    await convertToButterfly(trade);
+    await convertToButterfly(trade, losingSide);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -161,10 +165,9 @@ const start = async () => {
     initKiteLiveData();
     console.log("✅ Kite WebSocket ticker started");
 
-    // ── Main loop every 1 second ──────────────────────────────────────────────
+    // ── Fast loop every 1 second — monitor + entry checks ───────────────────
     setInterval(async () => {
       try {
-        await scanAndSyncOrders();
         await autoMonitorTick();
         await autoEnterIfNeeded();
 
@@ -182,7 +185,19 @@ const start = async () => {
       } catch (err) {
         console.error("❌ Main loop error:", err.message);
       }
-    }, 1000); // ✅ 1s polling — was 5s, safe with Kite paid API + dedicated server
+    }, 1000);
+
+    // ── Slow loop every 5 seconds — Kite position/order sync ─────────────────
+    // ✅ FIX: scanAndSyncOrders fetches Kite REST API (positions + orders).
+    //         Running it every 1s = 60 REST calls/min — unnecessary and rate-limit risky.
+    //         5s is sufficient for P&L display and SL cross-check.
+    setInterval(async () => {
+      try {
+        await scanAndSyncOrders();
+      } catch (err) {
+        console.error("❌ Scan loop error:", err.message);
+      }
+    }, 5000);
   });
 };
 

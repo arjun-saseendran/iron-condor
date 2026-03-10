@@ -43,6 +43,7 @@ export const executeMarketExit = async (trade, exitSide = 'FULL') => {
         for (const leg of shortLegs) {
             if (!isLive) {
                 console.log(`📝 [PAPER] BUY (Cover) ${trade.quantity} ${leg.symbol}`);
+                continue; // ✅ FIX: was falling through to live branch in paper mode
             } else {
                 console.log(`⏳ Closing short: ${leg.symbol}...`);
                 await kc.placeOrder('regular', {
@@ -61,6 +62,7 @@ export const executeMarketExit = async (trade, exitSide = 'FULL') => {
         for (const leg of longLegs) {
             if (!isLive) {
                 console.log(`📝 [PAPER] SELL (Close) ${trade.quantity} ${leg.symbol}`);
+                continue; // ✅ FIX: was falling through to live branch in paper mode
             } else {
                 console.log(`⏳ Closing long: ${leg.symbol}...`);
                 await kc.placeOrder('regular', {
@@ -116,29 +118,59 @@ export const executeMarginSafeEntry = async (buySymbol, sellSymbol, quantity, in
             return { success: true };
         }
 
+        // ✅ FIX: verify BUY complete before placing SELL — prevents naked position
+        const waitComplete = async (orderId, symbol) => {
+            for (let i = 0; i < 10; i++) {
+                await new Promise(r => setTimeout(r, 500));
+                const orders = await kc.getOrders();
+                const o = orders.find(x => x.order_id === orderId);
+                if (!o) continue;
+                if (o.status === 'COMPLETE') return;
+                if (o.status === 'REJECTED') throw new Error(`Order REJECTED: ${symbol} — ${o.status_message || 'no reason'}`);
+            }
+            throw new Error(`Order timeout: ${symbol} did not complete in 5s`);
+        };
+
         // Buy long first — no margin spike
         console.log(`⏳ Buying long leg: ${buySymbol}...`);
-        await kc.placeOrder('regular', {
+        const buyOrder = await kc.placeOrder('regular', {
             exchange,
             tradingsymbol:    buySymbol,
             transaction_type: 'BUY',
             quantity,
             order_type:       'MARKET',
-            product:          'MIS',   // ✅ FIX 1: was 'NRML'
+            product:          'MIS',
         });
-        console.log(`✅ Long leg placed: ${buySymbol}`);
+        await waitComplete(buyOrder.order_id, buySymbol);
+        console.log(`✅ Long leg confirmed: ${buySymbol}`);
 
-        // Then sell short
+        // Then sell short — only after BUY is confirmed
         console.log(`⏳ Selling short leg: ${sellSymbol}...`);
-        await kc.placeOrder('regular', {
-            exchange,
-            tradingsymbol:    sellSymbol,
-            transaction_type: 'SELL',
-            quantity,
-            order_type:       'MARKET',
-            product:          'MIS',   // ✅ FIX 1: was 'NRML'
-        });
-        console.log(`✅ Short leg placed: ${sellSymbol}`);
+        let sellOrder;
+        try {
+            sellOrder = await kc.placeOrder('regular', {
+                exchange,
+                tradingsymbol:    sellSymbol,
+                transaction_type: 'SELL',
+                quantity,
+                order_type:       'MARKET',
+                product:          'MIS',
+            });
+        } catch (sellErr) {
+            // SELL failed — close the BUY to avoid naked long
+            console.error(`❌ SELL failed (${sellSymbol}) — closing BUY leg ${buySymbol}`);
+            try { await kc.placeOrder('regular', { exchange, tradingsymbol: buySymbol, transaction_type: 'SELL', quantity, order_type: 'MARKET', product: 'MIS' }); } catch (_) {}
+            throw sellErr;
+        }
+        try {
+            await waitComplete(sellOrder.order_id, sellSymbol);
+        } catch (sellVerifyErr) {
+            // SELL rejected — close BUY immediately
+            console.error(`❌ SELL rejected (${sellSymbol}) — closing BUY leg ${buySymbol}`);
+            try { await kc.placeOrder('regular', { exchange, tradingsymbol: buySymbol, transaction_type: 'SELL', quantity, order_type: 'MARKET', product: 'MIS' }); } catch (_) {}
+            throw sellVerifyErr;
+        }
+        console.log(`✅ Short leg confirmed: ${sellSymbol}`);
 
         await sendCondorAlert(
             `🚀 <b>Entry Complete: ${index}</b>\n` +

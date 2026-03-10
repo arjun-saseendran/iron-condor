@@ -47,6 +47,16 @@ export const setAccessToken = (token) => {
 };
 
 export const getKiteInstance = () => {
-  if (!dailyAccessToken) loadTokenFromDisk();
+  // ✅ FIX: loadTokenFromDisk is async but was called without await here.
+  //         getKiteInstance must stay sync (used everywhere inline), so instead
+  //         we call the sync fallback directly — read token from env immediately.
+  //         loadTokenFromDisk() at startup already handles the proper async load.
+  if (!dailyAccessToken) {
+    const token = process.env.KITE_ACCESS_TOKEN;
+    if (token) {
+      dailyAccessToken = token;
+      kc.setAccessToken(token);
+    }
+  }
   return kc;
 };

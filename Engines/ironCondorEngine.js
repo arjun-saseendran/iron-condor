@@ -208,28 +208,42 @@ export const getNearestExpiry = (index) => {
 };
 
 // ─── Strike selection ─────────────────────────────────────────────────────────
+// ✅ FIX: Scan outward from ATM, keep updating candidate while net >= minPremium.
+//         Stop when net drops below minPremium — nothing further OTM will qualify.
+//         Result: farthest OTM spread with net >= minPremium, guaranteed no valid
+//         spread exists beyond it.
 export const selectCondorStrikes = (strikes, spot, index) => {
   const spread     = SPREAD[index]();
   const minPremium = MIN_PREMIUM[index]();
   const interval   = STRIKE_INTERVAL[index];
   const atm        = Math.round(spot / interval) * interval;
 
+  // Call side: scan from ATM outward, keep farthest valid spread
   let callSell = null, callBuy = null;
   for (let i = 0; i < strikes.length; i++) {
     if (strikes[i].strike < atm) continue;
     const buyRow = strikes.find(s => s.strike === strikes[i].strike + spread);
     if (!buyRow) continue;
     const net = strikes[i].callLtp - buyRow.callLtp;
-    if (net >= minPremium) { callSell = strikes[i]; callBuy = buyRow; break; }
+    if (net >= minPremium) {
+      callSell = strikes[i]; callBuy = buyRow;  // keep updating — farther is better
+    } else if (callSell) {
+      break;                                     // dropped below min — stop
+    }
   }
 
+  // Put side: scan from ATM outward, keep farthest valid spread
   let putSell = null, putBuy = null;
   for (let i = strikes.length - 1; i >= 0; i--) {
     if (strikes[i].strike > atm) continue;
     const buyRow = strikes.find(s => s.strike === strikes[i].strike - spread);
     if (!buyRow) continue;
     const net = strikes[i].putLtp - buyRow.putLtp;
-    if (net >= minPremium) { putSell = strikes[i]; putBuy = buyRow; break; }
+    if (net >= minPremium) {
+      putSell = strikes[i]; putBuy = buyRow;    // keep updating — farther is better
+    } else if (putSell) {
+      break;                                     // dropped below min — stop
+    }
   }
 
   if (!callSell) throw new Error(`No call spread with net >= ${minPremium} for ${index}`);
@@ -261,23 +275,35 @@ export const findReplacementSpread = (strikes, spot, index, side) => {
   const atm        = Math.round(spot / interval) * interval;
 
   if (side === "call") {
+    let best = null;
     for (let i = 0; i < strikes.length; i++) {
       if (strikes[i].strike < atm) continue;
       const buyRow = strikes.find(s => s.strike === strikes[i].strike + spread);
       if (!buyRow) continue;
       const net = strikes[i].callLtp - buyRow.callLtp;
-      if (net >= minPremium) return { sell: strikes[i], buy: buyRow, net };
+      if (net >= minPremium) {
+        best = { sell: strikes[i], buy: buyRow, net };
+      } else if (best) {
+        break;
+      }
     }
-    throw new Error(`No replacement call spread with net >= ${minPremium}`);
+    if (!best) throw new Error(`No replacement call spread with net >= ${minPremium}`);
+    return best;
   } else {
+    let best = null;
     for (let i = strikes.length - 1; i >= 0; i--) {
       if (strikes[i].strike > atm) continue;
       const buyRow = strikes.find(s => s.strike === strikes[i].strike - spread);
       if (!buyRow) continue;
       const net = strikes[i].putLtp - buyRow.putLtp;
-      if (net >= minPremium) return { sell: strikes[i], buy: buyRow, net };
+      if (net >= minPremium) {
+        best = { sell: strikes[i], buy: buyRow, net };
+      } else if (best) {
+        break;
+      }
     }
-    throw new Error(`No replacement put spread with net >= ${minPremium}`);
+    if (!best) throw new Error(`No replacement put spread with net >= ${minPremium}`);
+    return best;
   }
 };
 
@@ -308,17 +334,84 @@ const placeKiteOrder = async (tradingsymbol, transactionType, quantity, index) =
   return order.order_id;
 };
 
-// ENTRY: BUY leg first, then SELL leg (margin safety)
+// ─── Wait for order COMPLETE or REJECTED ─────────────────────────────────────
+// Polls Kite order status up to maxAttempts × intervalMs milliseconds.
+// Returns true if COMPLETE, throws if REJECTED or timeout.
+const waitForOrderComplete = async (orderId, tradingsymbol, maxAttempts = 10, intervalMs = 500) => {
+  if (!LIVE()) return true; // paper orders always succeed instantly
+  const kc = getKiteInstance();
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await new Promise(r => setTimeout(r, intervalMs));
+    const orders = await kc.getOrders();
+    const found  = orders.find(o => o.order_id === orderId);
+    if (!found) continue;
+    if (found.status === "COMPLETE") return true;
+    if (found.status === "REJECTED") {
+      throw new Error(`Order REJECTED: ${tradingsymbol} — ${found.status_message || "no reason"}`);
+    }
+    // OPEN / PENDING — keep waiting
+  }
+  throw new Error(`Order timeout: ${tradingsymbol} did not complete in ${(maxAttempts * intervalMs) / 1000}s`);
+};
+
+// ENTRY: BUY leg first (verified COMPLETE), then SELL leg
+// ✅ FIX: If BUY rejected → throw, SELL never placed
+//         If SELL rejected after BUY → close BUY immediately to avoid naked position
 const enterSpread = async (sellSymbol, buySymbol, quantity, index) => {
-  const buyId  = await placeKiteOrder(buySymbol,  "BUY",  quantity, index);
-  const sellId = await placeKiteOrder(sellSymbol, "SELL", quantity, index);
+  // 1. Place BUY
+  const buyId = await placeKiteOrder(buySymbol, "BUY", quantity, index);
+
+  // 2. Verify BUY complete before placing SELL
+  try {
+    await waitForOrderComplete(buyId, buySymbol);
+  } catch (buyErr) {
+    throw new Error(`Entry aborted — BUY leg failed: ${buyErr.message}`);
+  }
+
+  // 3. Place SELL
+  let sellId;
+  try {
+    sellId = await placeKiteOrder(sellSymbol, "SELL", quantity, index);
+  } catch (sellPlaceErr) {
+    // SELL placement failed — close BUY to avoid naked long
+    condorLog(`🚨 SELL placement failed (${sellSymbol}) — closing BUY leg ${buySymbol}`, "error");
+    try { await placeKiteOrder(buySymbol, "SELL", quantity, index); } catch (_) {}
+    throw new Error(`Entry aborted — SELL placement failed: ${sellPlaceErr.message}`);
+  }
+
+  // 4. Verify SELL complete
+  try {
+    await waitForOrderComplete(sellId, sellSymbol);
+  } catch (sellErr) {
+    // SELL rejected — close BUY immediately to avoid naked long
+    condorLog(`🚨 SELL leg REJECTED (${sellSymbol}) — closing BUY leg ${buySymbol}`, "error");
+    try { await placeKiteOrder(buySymbol, "SELL", quantity, index); } catch (_) {}
+    throw new Error(`Entry aborted — SELL leg rejected: ${sellErr.message}`);
+  }
+
   return { sellId, buyId };
 };
 
-// EXIT: close short (BUY back) first, then close long (SELL) — frees margin first
+// EXIT: close short (BUY back) first (verified), then close long (SELL)
+// ✅ FIX: Verifies buy-back complete before closing long leg
 const exitSpread = async (sellSymbol, buySymbol, quantity, index) => {
-  await placeKiteOrder(sellSymbol, "BUY",  quantity, index);
-  await placeKiteOrder(buySymbol,  "SELL", quantity, index);
+  // 1. Buy back the short leg
+  const buyBackId = await placeKiteOrder(sellSymbol, "BUY", quantity, index);
+
+  try {
+    await waitForOrderComplete(buyBackId, sellSymbol);
+  } catch (buyBackErr) {
+    // Buy-back failed — still try to close long, alert
+    condorLog(`🚨 Exit buy-back REJECTED (${sellSymbol}) — attempting to close long leg anyway`, "error");
+  }
+
+  // 2. Close the long leg
+  const sellCloseId = await placeKiteOrder(buySymbol, "SELL", quantity, index);
+  try {
+    await waitForOrderComplete(sellCloseId, buySymbol);
+  } catch (sellCloseErr) {
+    condorLog(`🚨 Exit sell-close REJECTED (${buySymbol}) — manual intervention may be required`, "error");
+  }
 };
 
 // ─── ENTER IRON CONDOR ────────────────────────────────────────────────────────
@@ -341,7 +434,9 @@ export const enterIronCondor = async (index, quantity, mode = "SEMI_AUTO") => {
   cacheAndSubscribe(callSellSym, sel.callSell.callKey);
   cacheAndSubscribe(callBuySym,  sel.callBuy.callKey);
   cacheAndSubscribe(putSellSym,  sel.putSell.putKey);
-  cacheAndSubscribe(putBuySym,   sel.putBuy.putKey);  const callOrders = await enterSpread(callSellSym, callBuySym, quantity, index);
+  cacheAndSubscribe(putBuySym,   sel.putBuy.putKey);
+
+  const callOrders = await enterSpread(callSellSym, callBuySym, quantity, index);
   const putOrders  = await enterSpread(putSellSym,  putBuySym,  quantity, index);
 
   const callEntry  = Math.max(0, sel.callSell.callLtp - sel.callBuy.callLtp);

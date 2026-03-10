@@ -27,6 +27,14 @@ export const initSocket = (httpServer) => {
 // setIO() lets server.js register its instance into this shared module.
 export const setIO = (ioInstance) => {
   io = ioInstance;
+  // ✅ FIX: initSocket() is never called in server.js (server creates its own io).
+  //         Wire up connection logging here so dashboard connections are tracked.
+  io.on("connection", (socket) => {
+    console.log(`🔌 UI connected: ${socket.id}`);
+    socket.on("disconnect", () =>
+      console.log(`🔌 UI disconnected: ${socket.id}`)
+    );
+  });
 };
 
 export const getIO = () => io || null;

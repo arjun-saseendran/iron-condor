@@ -49,7 +49,11 @@ export const getNextWeeklyExpiry = (symbol) => {
   for (let d = 0; d <= 7; d++) {
     const dt = new Date(ist);
     dt.setUTCDate(ist.getUTCDate() + d);
-    if (dt.getUTCDay() === targetDay) return dt;
+    // ✅ FIX: return "YYYY-MM-DD" string, not a Date object.
+    //         getNearestExpiry in ironCondorEngine also returns a string.
+    //         Returning a Date here caused symbol-building failures when callers
+    //         passed this result to buildKiteSymbol (which expects a string split on "-").
+    if (dt.getUTCDay() === targetDay) return dt.toISOString().split("T")[0];
   }
-  return ist;
+  return ist.toISOString().split("T")[0];
 };

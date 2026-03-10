@@ -65,8 +65,10 @@ const _connect = (apiKey, accessToken) => {
   ticker.on("ticks", (ticks) => {
     for (const tick of ticks) {
       const ltp = tick.last_price;
-      if (ltp && _priceCallback) {
-        _lastTickTime = Date.now();
+      // ✅ FIX: update _lastTickTime on ANY tick, even ltp=0 — feed is alive
+      //         Previously ltp=0 ticks were ignored, causing false stale detection
+      _lastTickTime = Date.now();
+      if (ltp != null && _priceCallback) {
         _priceCallback(tick.instrument_token, ltp);
       }
     }
@@ -82,6 +84,10 @@ const _connect = (apiKey, accessToken) => {
   ticker.on("error", (error) => {
     _feedConnected = false;
     console.error("❌ Kite WebSocket error:", error?.message || error);
+    // ✅ FIX: error event does NOT automatically trigger disconnect event in all cases.
+    //         Without this, ticker stays dead silently after a network error.
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => _connect(apiKey, accessToken), 5000);
   });
 
   ticker.on("noreconnect", () => {

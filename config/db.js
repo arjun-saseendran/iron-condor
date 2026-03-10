@@ -21,9 +21,18 @@ export const connectDatabases = async () => {
     process.exit(1);
   }
 
-  mongoose.connection.on("disconnected", () =>
-    console.warn("⚠️  MongoDB disconnected!")
-  );
+  mongoose.connection.on("disconnected", () => {
+    console.warn("⚠️  MongoDB disconnected — attempting reconnect in 5s...");
+    // ✅ FIX: auto-reconnect on unexpected disconnect (network blip, Atlas failover)
+    setTimeout(async () => {
+      try {
+        await mongoose.connect(uri);
+        console.log("✅ MongoDB reconnected");
+      } catch (err) {
+        console.error("❌ MongoDB reconnect failed:", err.message);
+      }
+    }, 5000);
+  });
   mongoose.connection.on("error", (err) =>
     console.error("❌ MongoDB error:", err.message)
   );

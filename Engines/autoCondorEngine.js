@@ -223,7 +223,8 @@ const checkButterflyConversion = async (trade) => {
   } else {
     // Semi-auto: set pending flag for UI banner
     if (!trade.butterflyPending) {
-      await getActiveTradeModel().updateOne({ _id: trade._id }, { $set: { butterflyPending: true } });
+      // ✅ FIX: store butterflySide so server.js butterfly route knows which side to pass
+      await getActiveTradeModel().updateOne({ _id: trade._id }, { $set: { butterflyPending: true, butterflySide: sideAtATM } });
       condorLog(`🦋 BUTTERFLY ALERT — ${trade.index} | sell leg at ATM + SL hit | awaiting dashboard action`, "warn");
       await sendCondorAlert(
         `🦋 <b>BUTTERFLY ALERT</b> · ${trade.index}\n` +
@@ -274,14 +275,15 @@ export const autoEnterIfNeeded = async () => {
     }
 
     const quantity = lots * lotSize;
-    _state.entryDone = true;
     condorLog(`🚀 Auto entry starting | ${index} | ${lots} lots × ${lotSize} = ${quantity} qty`, "info");
     try {
       await enterIronCondor(index, quantity, "FULL_AUTO");
+      // ✅ FIX: only mark entryDone on success — allows retry within 9:30–9:45 window if entry fails
+      _state.entryDone = true;
     } catch (err) {
       console.error(`❌ Auto entry ${index}:`, err.message);
-      condorLog(`❌ Auto entry FAILED | ${index} | ${err.message}`, "error");
-      await sendCondorAlert(`❌ <b>Auto entry failed</b> · ${index}\n<code>${err.message}</code>`);
+      condorLog(`❌ Auto entry FAILED | ${index} | ${err.message} — will retry next tick`, "error");
+      await sendCondorAlert(`❌ <b>Auto entry failed</b> · ${index}\n<code>${err.message}</code>\nWill retry within entry window.`);
     }
   }
 };

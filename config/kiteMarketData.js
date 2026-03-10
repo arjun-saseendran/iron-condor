@@ -44,11 +44,25 @@ export const getLastClose = async (instrumentKey) => {
 const _instrumentCache = {};    // exchange → instruments array
 const _instrumentCacheTime = {}; // exchange → timestamp
 
-const INSTRUMENT_CACHE_TTL = 6 * 60 * 60 * 1000; // 6 hours
+// ✅ FIX: reset instrument cache daily at midnight IST, not on a rolling 6h TTL.
+//         With 6h TTL, a server running past midnight serves yesterday's instruments
+//         at market open (9:15 IST) until 6h after last fetch.
+//         Now: cache is always invalidated after midnight IST.
+const _getMidnightISTTimestamp = () => {
+  const now = new Date();
+  const ist = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
+  // Midnight IST in UTC = 18:30 previous UTC day
+  const midnightIST = new Date(Date.UTC(
+    ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()
+  ) - (5.5 * 60 * 60 * 1000));
+  return midnightIST.getTime();
+};
 
 const _getInstruments = async (exchange) => {
   const now = Date.now();
-  if (_instrumentCache[exchange] && (now - _instrumentCacheTime[exchange]) < INSTRUMENT_CACHE_TTL) {
+  const lastMidnightIST = _getMidnightISTTimestamp();
+  // Cache is valid if it was fetched AFTER today's midnight IST
+  if (_instrumentCache[exchange] && _instrumentCacheTime[exchange] > lastMidnightIST) {
     return _instrumentCache[exchange];
   }
   const kc   = getKiteInstance();
@@ -64,7 +78,7 @@ export const getPCOptionChain = async (indexSymbol, expiryDate) => {
 
     // Determine exchange and underlying name from indexSymbol
     // indexSymbol format expected: "NSE:NIFTY 50" or "BSE:SENSEX"
-    const isNIFTY   = indexSymbol.includes("NIFTY");
+    // ✅ FIX: removed unused isNIFTY variable
     const isSENSEX  = indexSymbol.includes("SENSEX");
     const exchange  = isSENSEX ? "BFO" : "NFO";
     const underlying = isSENSEX ? "SENSEX" : "NIFTY";
@@ -101,11 +115,17 @@ export const getPCOptionChain = async (indexSymbol, expiryDate) => {
     const tradingSymbols = options.map(i => `${exchange}:${i.tradingsymbol}`);
 
     // Kite LTP accepts max 200 at a time
+    // ✅ FIX: wrap each batch in try/catch — one failing batch was throwing and
+    //         returning null for the entire chain, blocking entry completely
     const ltpMap = {};
     for (let i = 0; i < tradingSymbols.length; i += 200) {
-      const batch    = tradingSymbols.slice(i, i + 200);
-      const response = await kc.getLTP(batch);
-      if (response) Object.assign(ltpMap, response);
+      const batch = tradingSymbols.slice(i, i + 200);
+      try {
+        const response = await kc.getLTP(batch);
+        if (response) Object.assign(ltpMap, response);
+      } catch (batchErr) {
+        console.error(`⚠️ LTP batch ${i/200 + 1} failed: ${batchErr.message} — skipping batch`);
+      }
     }
 
     // Build chain rows in Upstox-compatible format (used by ironCondorEngine)

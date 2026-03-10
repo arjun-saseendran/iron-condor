@@ -315,6 +315,7 @@ const cacheAndSubscribe = (kiteSymbol, instrumentToken) => {
 };
 
 // ─── Kite order helpers ───────────────────────────────────────────────────────
+// Always NRML — positions are held till expiry (never intraday MIS)
 const placeKiteOrder = async (tradingsymbol, transactionType, quantity, index) => {
   if (!LIVE()) {
     const id = `PAPER-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -328,7 +329,7 @@ const placeKiteOrder = async (tradingsymbol, transactionType, quantity, index) =
     transaction_type: transactionType,
     quantity,
     order_type:       "MARKET",
-    product:          "MIS",
+    product:          "NRML",
   });
   console.log(`✅ Kite: ${transactionType} ${tradingsymbol} → ${order.order_id}`);
   return order.order_id;
@@ -434,9 +435,7 @@ export const enterIronCondor = async (index, quantity, mode = "SEMI_AUTO") => {
   cacheAndSubscribe(callSellSym, sel.callSell.callKey);
   cacheAndSubscribe(callBuySym,  sel.callBuy.callKey);
   cacheAndSubscribe(putSellSym,  sel.putSell.putKey);
-  cacheAndSubscribe(putBuySym,   sel.putBuy.putKey);
-
-  const callOrders = await enterSpread(callSellSym, callBuySym, quantity, index);
+  cacheAndSubscribe(putBuySym,   sel.putBuy.putKey);  const callOrders = await enterSpread(callSellSym, callBuySym, quantity, index);
   const putOrders  = await enterSpread(putSellSym,  putBuySym,  quantity, index);
 
   const callEntry  = Math.max(0, sel.callSell.callLtp - sel.callBuy.callLtp);

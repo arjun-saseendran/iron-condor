@@ -21,12 +21,13 @@ router.get('/chain', async (req, res) => {
 
   try {
     // ── Expiry ────────────────────────────────────────────────────────────────
-    const expiryDate  = getNextWeeklyExpiry(symbol);
-    const expiryLabel = expiryDate.toLocaleDateString('en-IN', {
+    // ✅ FIX: getNextWeeklyExpiry now returns "YYYY-MM-DD" string (not a Date object).
+    //         .toLocaleDateString() and .toISOString() are Date methods — would throw on a string.
+    const expiryStr   = getNextWeeklyExpiry(symbol);
+    const expiryLabel = new Date(expiryStr + "T00:00:00Z").toLocaleDateString('en-IN', {
       weekday: 'short', day: '2-digit', month: 'short', year: 'numeric',
       timeZone: 'Asia/Kolkata',
     });
-    const expiryStr = expiryDate.toISOString().split('T')[0];
 
     // ── Spot price ────────────────────────────────────────────────────────────
     let spotPrice    = null;

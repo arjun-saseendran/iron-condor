@@ -15,7 +15,7 @@ dotenv.config();
  * Sequence: exit shorts first (reduces margin), then longs.
  *
  * ✅ FIX 1: trade.lotSize → trade.quantity (model uses quantity, lotSize does not exist)
- * ✅ FIX 2: product 'NRML' → 'MIS' (intraday strategy, NRML requires overnight margin)
+ * product: always NRML — positions held till expiry, never intraday MIS
  */
 export const executeMarketExit = async (trade, exitSide = 'FULL') => {
     const kc       = getKiteInstance();
@@ -52,7 +52,7 @@ export const executeMarketExit = async (trade, exitSide = 'FULL') => {
                     transaction_type: 'BUY',
                     quantity:         trade.quantity,  // ✅ FIX 1: was trade.lotSize
                     order_type:       'MARKET',
-                    product:          'MIS',           // ✅ FIX 2: was 'NRML'
+                    product:          'NRML',
                 });
                 console.log(`✅ Short closed: ${leg.symbol}`);
             }
@@ -71,7 +71,7 @@ export const executeMarketExit = async (trade, exitSide = 'FULL') => {
                     transaction_type: 'SELL',
                     quantity:         trade.quantity,  // ✅ FIX 1: was trade.lotSize
                     order_type:       'MARKET',
-                    product:          'MIS',           // ✅ FIX 2: was 'NRML'
+                    product:          'NRML',
                 });
                 console.log(`✅ Long closed: ${leg.symbol}`);
             }
@@ -103,7 +103,7 @@ export const executeMarketExit = async (trade, exitSide = 'FULL') => {
  * Buy long first (no margin spike), then sell short.
  * Used for entries and one-click roll adjustments.
  *
- * ✅ FIX 1: product 'NRML' → 'MIS'
+ * product: always NRML — positions held till expiry
  * ✅ FIX 2: live mode now returns { success: true } — was falling off end of try
  *           block returning undefined, causing engine DB writes to fail silently
  */
@@ -132,14 +132,15 @@ export const executeMarginSafeEntry = async (buySymbol, sellSymbol, quantity, in
         };
 
         // Buy long first — no margin spike
-        console.log(`⏳ Buying long leg: ${buySymbol}...`);
+        const product = 'NRML';
+        console.log(`⏳ Buying long leg: ${buySymbol}... [${product}]`);
         const buyOrder = await kc.placeOrder('regular', {
             exchange,
             tradingsymbol:    buySymbol,
             transaction_type: 'BUY',
             quantity,
             order_type:       'MARKET',
-            product:          'MIS',
+            product,
         });
         await waitComplete(buyOrder.order_id, buySymbol);
         console.log(`✅ Long leg confirmed: ${buySymbol}`);
@@ -154,12 +155,12 @@ export const executeMarginSafeEntry = async (buySymbol, sellSymbol, quantity, in
                 transaction_type: 'SELL',
                 quantity,
                 order_type:       'MARKET',
-                product:          'MIS',
+                product:          'NRML',
             });
         } catch (sellErr) {
             // SELL failed — close the BUY to avoid naked long
             console.error(`❌ SELL failed (${sellSymbol}) — closing BUY leg ${buySymbol}`);
-            try { await kc.placeOrder('regular', { exchange, tradingsymbol: buySymbol, transaction_type: 'SELL', quantity, order_type: 'MARKET', product: 'MIS' }); } catch (_) {}
+            try { await kc.placeOrder('regular', { exchange, tradingsymbol: buySymbol, transaction_type: 'SELL', quantity, order_type: 'MARKET', product: 'NRML' }); } catch (_) {}
             throw sellErr;
         }
         try {
@@ -167,7 +168,7 @@ export const executeMarginSafeEntry = async (buySymbol, sellSymbol, quantity, in
         } catch (sellVerifyErr) {
             // SELL rejected — close BUY immediately
             console.error(`❌ SELL rejected (${sellSymbol}) — closing BUY leg ${buySymbol}`);
-            try { await kc.placeOrder('regular', { exchange, tradingsymbol: buySymbol, transaction_type: 'SELL', quantity, order_type: 'MARKET', product: 'MIS' }); } catch (_) {}
+            try { await kc.placeOrder('regular', { exchange, tradingsymbol: buySymbol, transaction_type: 'SELL', quantity, order_type: 'MARKET', product: 'NRML' }); } catch (_) {}
             throw sellVerifyErr;
         }
         console.log(`✅ Short leg confirmed: ${sellSymbol}`);

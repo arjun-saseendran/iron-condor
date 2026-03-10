@@ -34,6 +34,9 @@ const schema = new mongoose.Schema(
     firefightPending: { type: Boolean, default: false },
     butterflyPending: { type: Boolean, default: false },
     firefightSide:    { type: String, default: null },
+    // ✅ FIX: butterflySide stores which side triggered butterfly conversion (sideAtATM).
+    //         server.js butterfly route reads this to pass losingSide to convertToButterfly.
+    butterflySide:    { type: String, default: null },
 
     enteredAt: { type: Date, default: Date.now },
   },

@@ -38,6 +38,11 @@ const schema = new mongoose.Schema(
     //         server.js butterfly route reads this to pass losingSide to convertToButterfly.
     butterflySide:    { type: String, default: null },
 
+    // ✅ NEW: after slCount=1, track if single-side firefight on profit side was done.
+    //         false = watch for profit side 70% decay alone (no need for losing side 3x)
+    //         true  = post-SL firefight done, resume normal dual-condition FF rules
+    postSlFirefightDone: { type: Boolean, default: false },
+
     enteredAt: { type: Date, default: Date.now },
   },
   { timestamps: true }

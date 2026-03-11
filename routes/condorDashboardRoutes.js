@@ -68,9 +68,10 @@ router.get("/positions", async (req, res) => {
       pnl:         pnl.toFixed(2),
       pnlSource:   kitePnl !== null ? "kite" : "live",
       buffer:      buffer.toFixed(2),
-      firefightPending: trade.firefightPending,
-      firefightSide:    trade.firefightSide,
-      butterflyPending: trade.butterflyPending,
+      firefightPending:    trade.firefightPending,
+      firefightSide:       trade.firefightSide,
+      butterflyPending:    trade.butterflyPending,
+      postSlFirefightDone: trade.postSlFirefightDone || false,
       call: {
         sellSymbol:  trade.symbols.callSell,
         buySymbol:   trade.symbols.callBuy,

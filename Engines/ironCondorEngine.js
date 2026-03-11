@@ -78,6 +78,13 @@ const condorLog = (msg, level = "info") => {
 //         causing the guard to permanently lock and freeze all future SL checks)
 let _actionInProgress = false;
 
+// ─── SL reset in-progress guard ───────────────────────────────────────────────
+// ✅ FIX: duplicate SL alerts fired because onPriceUpdate tick AND scanAndSyncOrders
+//         both call _checkConditions independently. _actionInProgress only blocks
+//         within one caller — if tick and 5s scan fire at same millisecond, both
+//         can enter executeSLReset. This flag blocks at the function level.
+let _slResetInProgress = false;
+
 // ─── Stale feed alert tracker ─────────────────────────────────────────────────
 // Prevents sending repeated Telegram alerts every 5s when feed is dark.
 // Resets when feed recovers so the "recovered" alert fires once.
@@ -589,6 +596,13 @@ export const executeFirefight = async (trade, profitSide) => {
 
 // ─── SL RESET ────────────────────────────────────────────────────────────────
 export const executeSLReset = async (trade, losingSide) => {
+  // ✅ FIX: block duplicate SL resets fired by concurrent tick + 5s scan
+  if (_slResetInProgress) {
+    console.warn(`⚠️ SL reset already in progress — skipping duplicate for ${losingSide}`);
+    return;
+  }
+  _slResetInProgress = true;
+
   const ActiveTrade = getActiveTradeModel();
   const newSlCount  = (trade.slCount || 0) + 1;
 
@@ -601,6 +615,7 @@ export const executeSLReset = async (trade, losingSide) => {
     const fresh = await ActiveTrade.findById(trade._id);
     await sendCondorAlert(`🛑 <b>2nd SL HIT</b> · ${trade.index} · Exiting all`);
     await exitAllLegs(fresh, "BOTH_SL");
+    _slResetInProgress = false; // 🔓 Release guard
     return;
   }
 
@@ -634,8 +649,9 @@ export const executeSLReset = async (trade, losingSide) => {
   const newOrders = await enterSpread(newSellSym, newBuySym, trade.quantity, trade.index);
 
   const upd = {
-    slCount:       newSlCount,
-    bufferPremium: 0,
+    slCount:             newSlCount,
+    bufferPremium:       0,
+    postSlFirefightDone: false, // ✅ NEW: reset so engine watches for single-side FF after this SL
     // ✅ FIX: same totalEntryPremium ternary bug fixed here too
     totalEntryPremium:
       (losingSide === "call" ? replacement.net              : trade.callSpreadEntryPremium) +
@@ -662,6 +678,7 @@ export const executeSLReset = async (trade, losingSide) => {
     `slCount: <b>${newSlCount}</b> · Buffer: reset to 0`
   );
   condorLog(`🔄 SL RESET ${trade.index} | ${losingSide} | new: ${newSellSym}/${newBuySym} net=${replacement.net.toFixed(2)} | slCount=${newSlCount}`, "warn");
+  _slResetInProgress = false; // 🔓 Release guard
 };
 
 // ─── CONVERT TO BUTTERFLY ─────────────────────────────────────────────────────
@@ -765,7 +782,10 @@ onPriceUpdate(async (instrumentToken, ltp) => {
   // so getLastTickAge() would return ~0. We track dark duration separately.
   if (_staleAlertSent) {
     _staleAlertSent = false;
-    condorLog(`✅ Kite feed RECOVERED — SL/FF checks resuming`, "success");
+    // ✅ FIX: only alert if active trade exists — no spam after market hours
+    const ActiveTrade = getActiveTradeModel();
+    const hasTrade = await ActiveTrade.findOne({ status: "ACTIVE" }).lean().catch(() => null);
+    if (hasTrade) condorLog(`✅ Kite feed RECOVERED — SL/FF checks resuming`, "success");
   }
 
   const io = getIO();
@@ -818,6 +838,44 @@ const _checkConditions = async (trade) => {
   // Confirmed logic is correct as written.
   const callLosing = callNet >= firefightLossLevel(callEntry) && putNet  <= firefightProfitLevel(putEntry);
   const putLosing  = putNet  >= firefightLossLevel(putEntry)  && callNet <= firefightProfitLevel(callEntry);
+
+  // ✅ NEW: Post-SL single-side firefight logic
+  // After slCount=1 and postSlFirefightDone=false:
+  //   If profit side reaches 70% decay (net ≤ entry × 0.30) → firefight that side ALONE
+  //   No need to wait for losing side to reach 3x — market is trending, lock profit now
+  // After post-SL firefight done → postSlFirefightDone=true → resume normal dual-condition rules
+  if (trade.slCount >= 1 && !trade.postSlFirefightDone) {
+    const callDecayed = callNet <= firefightProfitLevel(callEntry);
+    const putDecayed  = putNet  <= firefightProfitLevel(putEntry);
+
+    // Determine which side is profit (decayed) — only act if exactly one side decayed
+    const postSlProfitSide = callDecayed && !putDecayed ? "call"
+                           : putDecayed  && !callDecayed ? "put"
+                           : null;
+
+    if (postSlProfitSide) {
+      condorLog(`⚔️ POST-SL FIREFIGHT | slCount=${trade.slCount} | ${postSlProfitSide} decayed 70% — firefighting without waiting for other side 3x`, "warn");
+
+      if (trade.mode === "FULL_AUTO") {
+        // Mark postSlFirefightDone BEFORE executing to prevent duplicate triggers
+        await getActiveTradeModel().updateOne({ _id: trade._id }, { $set: { postSlFirefightDone: true } });
+        await executeFirefight(trade, postSlProfitSide);
+      } else {
+        if (!trade.firefightPending) {
+          await getActiveTradeModel().updateOne({ _id: trade._id }, {
+            $set: { firefightPending: true, firefightSide: postSlProfitSide, postSlFirefightDone: true }
+          });
+          condorLog(`⚔️ POST-SL FIREFIGHT ALERT | profit=${postSlProfitSide} decayed 70% | awaiting dashboard action`, "warn");
+          await sendCondorAlert(
+            `⚔️ <b>POST-SL FIREFIGHT ALERT</b> · ${trade.index}\n` +
+            `slCount=1 · ${postSlProfitSide} decayed 70% · Lock profit now\n` +
+            `Click firefight on dashboard`
+          );
+        }
+      }
+      return;
+    }
+  }
 
   if (callLosing || putLosing) {
     const profitSide = callLosing ? "put" : "call";
@@ -929,12 +987,17 @@ export const scanAndSyncOrders = async () => {
   if (isFeedStale()) {
     if (!_staleAlertSent) {
       _staleAlertSent = true;
-      const age = getLastTickAge();
-      const msg = age
-        ? `🚨 Kite feed STALE (${age}s since last tick) — SL/FF checks PAUSED. Reconnecting…`
-        : `🚨 Kite feed DARK — no ticks received yet. SL/FF checks PAUSED.`;
-      console.error(msg);
-      condorLog(msg, "error");
+      // ✅ FIX: only alert if active trade exists — no spam after market hours
+      const ActiveTrade = getActiveTradeModel();
+      const hasTrade = await ActiveTrade.findOne({ status: "ACTIVE" }).lean().catch(() => null);
+      if (hasTrade) {
+        const age = getLastTickAge();
+        const msg = age
+          ? `🚨 Kite feed STALE (${age}s since last tick) — SL/FF checks PAUSED. Reconnecting…`
+          : `🚨 Kite feed DARK — no ticks received yet. SL/FF checks PAUSED.`;
+        console.error(msg);
+        condorLog(msg, "error");
+      }
     }
     return;
   }

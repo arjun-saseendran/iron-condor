@@ -204,4 +204,9 @@ const start = async () => {
 // ─── Cron: reset day state at 9:00 AM IST weekdays ───────────────────────────
 cron.schedule("0 9 * * 1-5", () => resetAutoCondorDay(), { timezone: "Asia/Kolkata" });
 
+// ─── Cron: auto-disarm at 3:35 PM IST weekdays ───────────────────────────────
+// Stops monitoring loop after market close — positions expire naturally on expiry day
+// No positions are touched — only disarms the auto condor engine
+cron.schedule("35 15 * * 1-5", () => resetAutoCondorDay(), { timezone: "Asia/Kolkata" });
+
 start();

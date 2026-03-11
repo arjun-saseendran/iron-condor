@@ -52,6 +52,7 @@ export const executeMarketExit = async (trade, exitSide = 'FULL') => {
                     transaction_type: 'BUY',
                     quantity:         trade.quantity,  // ✅ FIX 1: was trade.lotSize
                     order_type:       'MARKET',
+                    market_protection: 1,
                     product:          'NRML',
                 });
                 console.log(`✅ Short closed: ${leg.symbol}`);
@@ -71,6 +72,7 @@ export const executeMarketExit = async (trade, exitSide = 'FULL') => {
                     transaction_type: 'SELL',
                     quantity:         trade.quantity,  // ✅ FIX 1: was trade.lotSize
                     order_type:       'MARKET',
+                    market_protection: 1,
                     product:          'NRML',
                 });
                 console.log(`✅ Long closed: ${leg.symbol}`);
@@ -140,6 +142,7 @@ export const executeMarginSafeEntry = async (buySymbol, sellSymbol, quantity, in
             transaction_type: 'BUY',
             quantity,
             order_type:       'MARKET',
+                    market_protection: 1,
             product,
         });
         await waitComplete(buyOrder.order_id, buySymbol);
@@ -155,12 +158,13 @@ export const executeMarginSafeEntry = async (buySymbol, sellSymbol, quantity, in
                 transaction_type: 'SELL',
                 quantity,
                 order_type:       'MARKET',
+                    market_protection: 1,
                 product:          'NRML',
             });
         } catch (sellErr) {
             // SELL failed — close the BUY to avoid naked long
             console.error(`❌ SELL failed (${sellSymbol}) — closing BUY leg ${buySymbol}`);
-            try { await kc.placeOrder('regular', { exchange, tradingsymbol: buySymbol, transaction_type: 'SELL', quantity, order_type: 'MARKET', product: 'NRML' }); } catch (_) {}
+            try { await kc.placeOrder('regular', { exchange, tradingsymbol: buySymbol, transaction_type: 'SELL', quantity, order_type: 'MARKET', market_protection: 1, product: 'NRML' }); } catch (_) {}
             throw sellErr;
         }
         try {
@@ -168,7 +172,7 @@ export const executeMarginSafeEntry = async (buySymbol, sellSymbol, quantity, in
         } catch (sellVerifyErr) {
             // SELL rejected — close BUY immediately
             console.error(`❌ SELL rejected (${sellSymbol}) — closing BUY leg ${buySymbol}`);
-            try { await kc.placeOrder('regular', { exchange, tradingsymbol: buySymbol, transaction_type: 'SELL', quantity, order_type: 'MARKET', product: 'NRML' }); } catch (_) {}
+            try { await kc.placeOrder('regular', { exchange, tradingsymbol: buySymbol, transaction_type: 'SELL', quantity, order_type: 'MARKET', market_protection: 1, product: 'NRML' }); } catch (_) {}
             throw sellVerifyErr;
         }
         console.log(`✅ Short leg confirmed: ${sellSymbol}`);

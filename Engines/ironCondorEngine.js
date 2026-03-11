@@ -153,12 +153,12 @@ export const getKitePnL = (trade) => {
 const SL_MULT       = () => parseFloat(process.env.SL_MULTIPLIER       || "4");
 const FF_LOSS_MULT  = () => parseFloat(process.env.FF_LOSS_MULTIPLIER   || "3");
 const FF_PROFIT_THR = () => parseFloat(process.env.FF_PROFIT_THRESHOLD  || "0.30");
-const BF_SL_MULT    = () => parseFloat(process.env.BF_SL_MULTIPLIER     || "3");
+const BF_SL_MULT    = () => parseFloat(process.env.BF_SL_MULTIPLIER     || "5");
 
 const slLevel              = (entry, buffer) => entry * SL_MULT()       + buffer;
 const firefightLossLevel   = (entry)         => entry * FF_LOSS_MULT();
 const firefightProfitLevel = (entry)         => entry * FF_PROFIT_THR();
-const butterflySLLevel     = (total, buffer) => total * BF_SL_MULT()    + buffer;
+const butterflySLLevel     = (losingEntry, newEntry, buffer) => (losingEntry * BF_SL_MULT()) + newEntry + buffer;
 
 // ─── Option chain ─────────────────────────────────────────────────────────────
 export const fetchFullOptionChain = async (index, expiry) => {
@@ -748,10 +748,15 @@ export const convertToButterfly = async (trade, losingSide) => {
   // 4. Update DB — keep losing side symbols unchanged, update profit side to new ATM spread
   const losingEntry = losingSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
   const totalEntry  = losingEntry + newEntry;
-  const bfSL        = butterflySLLevel(totalEntry, newBuffer);
+  // bfSL = (losingEntry × 5) + newEntry + buffer
+  // Real loss at exit = bfSL - (losingEntry + newEntry + buffer) = losingEntry × 4 = 2%
+  const bfSL = butterflySLLevel(losingEntry, newEntry, newBuffer);
 
   const upd = {
-    isIronButterfly:   true,
+    isIronButterfly:            true,
+    losingSpreadEntryPremium:   losingEntry, // original losing side collected premium
+    newSpreadEntryPremium:      newEntry,    // fresh ATM spread collected premium
+    butterflySL:                bfSL,        // stored once — checked on every tick
     butterflyPending:  false,
     bufferPremium:     newBuffer,
     totalEntryPremium: totalEntry,
@@ -829,12 +834,16 @@ const _checkConditions = async (trade) => {
   const totalEntry = trade.totalEntryPremium;
 
   // ── Butterfly SL ────────────────────────────────────────────────────────────
+  // Only for iron butterfly positions (slCount=0, expiry day conversion).
+  // bfSL is calculated ONCE at conversion and stored in DB:
+  //   bfSL = (losingEntry × 5) + newEntry + buffer
+  // On every tick: if live (callNet + putNet) >= bfSL → real loss = 2% → exit.
   if (trade.isIronButterfly) {
-    const bfSL  = butterflySLLevel(totalEntry, buffer);
+    const bfSL  = trade.butterflySL;
     const bfNet = callNet + putNet;
     if (bfNet >= bfSL) {
       console.log(`🛑 Butterfly SL hit bfNet=${bfNet.toFixed(2)} bfSL=${bfSL.toFixed(2)}`);
-      condorLog(`🛑 BUTTERFLY SL HIT | net=${bfNet.toFixed(2)} SL=${bfSL.toFixed(2)} | exiting all`, "error");
+      condorLog(`🛑 BUTTERFLY SL HIT | bfNet=${bfNet.toFixed(2)} bfSL=${bfSL.toFixed(2)} | exiting all`, "error");
       await exitAllLegs(trade, "BUTTERFLY_SL");
     }
     return;
@@ -986,7 +995,7 @@ export const scanAndSyncOrders = async () => {
         ff3x:           firefightLossLevel(putEntry).toFixed(2),
         ffProfit:       firefightProfitLevel(putEntry).toFixed(2),
       },
-      butterflySL:      trade.isIronButterfly ? butterflySLLevel(totalEntry, buffer).toFixed(2) : null,
+      butterflySL:      trade.isIronButterfly ? trade.butterflySL?.toFixed(2) : null,
       firefightPending: trade.firefightPending,
       firefightSide:    trade.firefightSide,
       butterflyPending: trade.butterflyPending,

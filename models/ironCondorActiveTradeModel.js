@@ -30,6 +30,14 @@ const schema = new mongoose.Schema(
     slCount:         { type: Number, default: 0 },
     isIronButterfly: { type: Boolean, default: false },
 
+    // Butterfly SL fields — set at conversion time in convertToButterfly()
+    // losingSpreadEntryPremium: original collected premium of the side that hit SL (ATM side)
+    // newSpreadEntryPremium:    collected premium of fresh ATM spread entered on profit side
+    // SL formula: (losingSpreadEntryPremium x BF_SL_MULT) - newSpreadEntryPremium + buffer
+    losingSpreadEntryPremium: { type: Number, default: 0 },
+    newSpreadEntryPremium:    { type: Number, default: 0 },
+    butterflySL:              { type: Number, default: 0 },  // calculated once at conversion, checked on every tick
+
     // Semi-auto UI flags
     firefightPending: { type: Boolean, default: false },
     butterflyPending: { type: Boolean, default: false },

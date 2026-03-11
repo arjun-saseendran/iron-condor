@@ -620,11 +620,7 @@ export const executeSLReset = async (trade, losingSide) => {
   }
 
   // 1st SL — capture losing spread live price BEFORE exit (display only — not used in core logic)
-  const getLtp = (sym) => {
-    if (!sym) return 0;
-    const key = kiteSymbolToToken(sym);
-    return key ? (condorPrices[key] || 0) : 0;
-  };
+  // Uses top-level getLtp (already defined above) — no duplicate needed
   const losingSellSym = losingSide === "call" ? trade.symbols.callSell : trade.symbols.putSell;
   const losingBuySym  = losingSide === "call" ? trade.symbols.callBuy  : trade.symbols.putBuy;
   const losingNet     = Math.max(0, getLtp(losingSellSym) - getLtp(losingBuySym));

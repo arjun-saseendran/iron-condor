@@ -53,10 +53,13 @@ router.get("/positions", async (req, res) => {
     const totalEntry = trade.totalEntryPremium;
 
     // Prefer Kite P&L
-    const kitePnl = getKitePnL(trade);
-    const pnl     = kitePnl !== null
-      ? kitePnl
-      : ((callEntry - callNet) + (putEntry - putNet)) * trade.quantity;
+    const kitePnl    = getKitePnL(trade);
+    const slLoss     = trade.slBookedLoss || 0; // ✅ NEW: loss booked from previous SL exits
+    const livePnl    = ((callEntry - callNet) + (putEntry - putNet)) * trade.quantity;
+    // Net P&L = current spread profit − already booked SL losses
+    const pnl        = kitePnl !== null
+      ? kitePnl           // Kite REST gives true settled P&L including SL losses
+      : livePnl - slLoss; // Estimated: current profit minus SL losses
 
     res.json({
       status:      "ACTIVE",
@@ -72,6 +75,7 @@ router.get("/positions", async (req, res) => {
       firefightSide:       trade.firefightSide,
       butterflyPending:    trade.butterflyPending,
       postSlFirefightDone: trade.postSlFirefightDone || false,
+      slBookedLoss:        slLoss.toFixed(2),
       call: {
         sellSymbol:  trade.symbols.callSell,
         buySymbol:   trade.symbols.callBuy,

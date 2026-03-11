@@ -43,6 +43,11 @@ const schema = new mongoose.Schema(
     //         true  = post-SL firefight done, resume normal dual-condition FF rules
     postSlFirefightDone: { type: Boolean, default: false },
 
+    // ✅ NEW: cumulative loss booked from SL exits (display only — never used in core logic)
+    //         Captured at SL moment = losing spread live net × quantity
+    //         Used only by dashboard to show accurate net P&L
+    slBookedLoss: { type: Number, default: 0 },
+
     enteredAt: { type: Date, default: Date.now },
   },
   { timestamps: true }

@@ -619,7 +619,21 @@ export const executeSLReset = async (trade, losingSide) => {
     return;
   }
 
-  // 1st SL — exit losing spread first
+  // 1st SL — capture losing spread live price BEFORE exit (display only — not used in core logic)
+  const getLtp = (sym) => {
+    if (!sym) return 0;
+    const key = kiteSymbolToToken(sym);
+    return key ? (condorPrices[key] || 0) : 0;
+  };
+  const losingSellSym = losingSide === "call" ? trade.symbols.callSell : trade.symbols.putSell;
+  const losingBuySym  = losingSide === "call" ? trade.symbols.callBuy  : trade.symbols.putBuy;
+  const losingNet     = Math.max(0, getLtp(losingSellSym) - getLtp(losingBuySym));
+  const losingEntry   = losingSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
+  // Loss = how much above entry we're buying back (× qty) — positive number means loss
+  const slLossThisSide = Math.max(0, losingNet - losingEntry) * trade.quantity;
+  const prevBookedLoss = trade.slBookedLoss || 0;
+
+  // Exit losing spread
   try {
     if (losingSide === "call") {
       await exitSpread(trade.symbols.callSell, trade.symbols.callBuy, trade.quantity, trade.index);
@@ -652,6 +666,7 @@ export const executeSLReset = async (trade, losingSide) => {
     slCount:             newSlCount,
     bufferPremium:       0,
     postSlFirefightDone: false, // ✅ NEW: reset so engine watches for single-side FF after this SL
+    slBookedLoss:        prevBookedLoss + slLossThisSide, // ✅ NEW: accumulate SL loss (display only)
     // ✅ FIX: same totalEntryPremium ternary bug fixed here too
     totalEntryPremium:
       (losingSide === "call" ? replacement.net              : trade.callSpreadEntryPremium) +

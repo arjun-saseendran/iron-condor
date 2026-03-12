@@ -322,13 +322,17 @@ const cacheAndSubscribe = (kiteSymbol, instrumentToken) => {
 };
 
 // ─── Kite order helpers ───────────────────────────────────────────────────────
-// Always NRML — positions are held till expiry (never intraday MIS)
-const placeKiteOrder = async (tradingsymbol, transactionType, quantity, index) => {
+// Always NRML — positions held till expiry, never intraday MIS
+// place order → wait for Kite COMPLETE → return { orderId, avgPrice }
+// If REJECTED or timeout → throw immediately, caller must handle
+
+const placeAndConfirm = async (tradingsymbol, transactionType, quantity, index) => {
   if (!LIVE()) {
     const id = `PAPER-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     console.log(`📝 [PAPER] ${transactionType} ${quantity} × ${tradingsymbol}`);
-    return id;
+    return { orderId: id, avgPrice: 0 };
   }
+
   const kc    = getKiteInstance();
   const order = await kc.placeOrder("regular", {
     exchange:         getKiteExchange(index),
@@ -337,93 +341,132 @@ const placeKiteOrder = async (tradingsymbol, transactionType, quantity, index) =
     quantity,
     order_type:       "MARKET",
     product:          "NRML",
+    market_protection: 1,
   });
-  console.log(`✅ Kite: ${transactionType} ${tradingsymbol} → ${order.order_id}`);
-  return order.order_id;
-};
 
-// ─── Wait for order COMPLETE or REJECTED ─────────────────────────────────────
-// Polls Kite order status up to maxAttempts × intervalMs milliseconds.
-// Returns true if COMPLETE, throws if REJECTED or timeout.
-const waitForOrderComplete = async (orderId, tradingsymbol, maxAttempts = 10, intervalMs = 500) => {
-  if (!LIVE()) return true; // paper orders always succeed instantly
-  const kc = getKiteInstance();
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    await new Promise(r => setTimeout(r, intervalMs));
+  const orderId = order.order_id;
+  console.log(`⏳ Kite: ${transactionType} ${tradingsymbol} → waiting confirm (${orderId})`);
+
+  // Poll Kite until COMPLETE or REJECTED — max 10 attempts × 500ms = 5s
+  for (let i = 0; i < 10; i++) {
+    await new Promise(r => setTimeout(r, 500));
     const orders = await kc.getOrders();
     const found  = orders.find(o => o.order_id === orderId);
     if (!found) continue;
-    if (found.status === "COMPLETE") return true;
+    if (found.status === "COMPLETE") {
+      const avgPrice = found.average_price || 0;
+      console.log(`✅ Kite confirmed: ${transactionType} ${tradingsymbol} avgPrice=${avgPrice}`);
+      return { orderId, avgPrice };
+    }
     if (found.status === "REJECTED") {
-      throw new Error(`Order REJECTED: ${tradingsymbol} — ${found.status_message || "no reason"}`);
+      throw new Error(`REJECTED: ${tradingsymbol} — ${found.status_message || "no reason"}`);
     }
     // OPEN / PENDING — keep waiting
   }
-  throw new Error(`Order timeout: ${tradingsymbol} did not complete in ${(maxAttempts * intervalMs) / 1000}s`);
+  throw new Error(`Timeout: ${tradingsymbol} did not confirm in 5s`);
 };
 
-// ENTRY: BUY leg first (verified COMPLETE), then SELL leg
-// ✅ FIX: If BUY rejected → throw, SELL never placed
-//         If SELL rejected after BUY → close BUY immediately to avoid naked position
+// ENTRY: BUY long leg first (confirmed), then SELL short leg (confirmed)
+// Returns actual filled avgPrice for both legs from Kite
+// If SELL fails after BUY confirmed — exit BUY immediately, throw
 const enterSpread = async (sellSymbol, buySymbol, quantity, index) => {
-  // 1. Place BUY
-  const buyId = await placeKiteOrder(buySymbol, "BUY", quantity, index);
-
-  // 2. Verify BUY complete before placing SELL
+  // 1. Place and confirm BUY
+  let buyResult;
   try {
-    await waitForOrderComplete(buyId, buySymbol);
+    buyResult = await placeAndConfirm(buySymbol, "BUY", quantity, index);
   } catch (buyErr) {
     throw new Error(`Entry aborted — BUY leg failed: ${buyErr.message}`);
   }
 
-  // 3. Place SELL
-  let sellId;
+  // 2. Place and confirm SELL — only after BUY confirmed
+  let sellResult;
   try {
-    sellId = await placeKiteOrder(sellSymbol, "SELL", quantity, index);
-  } catch (sellPlaceErr) {
-    // SELL placement failed — close BUY to avoid naked long
-    condorLog(`🚨 SELL placement failed (${sellSymbol}) — closing BUY leg ${buySymbol}`, "error");
-    try { await placeKiteOrder(buySymbol, "SELL", quantity, index); } catch (_) {}
-    throw new Error(`Entry aborted — SELL placement failed: ${sellPlaceErr.message}`);
-  }
-
-  // 4. Verify SELL complete
-  try {
-    await waitForOrderComplete(sellId, sellSymbol);
+    sellResult = await placeAndConfirm(sellSymbol, "SELL", quantity, index);
   } catch (sellErr) {
-    // SELL rejected — close BUY immediately to avoid naked long
-    condorLog(`🚨 SELL leg REJECTED (${sellSymbol}) — closing BUY leg ${buySymbol}`, "error");
-    try { await placeKiteOrder(buySymbol, "SELL", quantity, index); } catch (_) {}
-    throw new Error(`Entry aborted — SELL leg rejected: ${sellErr.message}`);
+    // SELL failed — exit the confirmed BUY immediately to avoid naked position
+    condorLog(`🚨 SELL failed (${sellSymbol}) — closing BUY leg ${buySymbol}`, "error");
+    try { await placeAndConfirm(buySymbol, "SELL", quantity, index); } catch (_) {}
+    throw new Error(`Entry aborted — SELL leg failed: ${sellErr.message}`);
   }
 
-  return { sellId, buyId };
+  // net = actual sell fill price − actual buy fill price
+  const actualNet = Math.max(0, sellResult.avgPrice - buyResult.avgPrice);
+  console.log(`✅ Spread entered: SELL ${sellSymbol} avg=${sellResult.avgPrice} BUY ${buySymbol} avg=${buyResult.avgPrice} net=${actualNet}`);
+
+  return {
+    sellId:   sellResult.orderId,
+    buyId:    buyResult.orderId,
+    sellAvg:  sellResult.avgPrice,
+    buyAvg:   buyResult.avgPrice,
+    actualNet,
+  };
 };
 
-// EXIT: close short (BUY back) first (verified), then close long (SELL)
-// ✅ FIX: Verifies buy-back complete before closing long leg
-const exitSpread = async (sellSymbol, buySymbol, quantity, index) => {
-  // 1. Buy back the short leg
-  const buyBackId = await placeKiteOrder(sellSymbol, "BUY", quantity, index);
+// EXIT WITH FILL: same as exitSpread but returns actual avgPrice from Kite for both legs
+// Used in firefight to calculate real buffer from actual exit fill prices
+const exitSpreadWithFill = async (sellSymbol, buySymbol, quantity, index) => {
+  let buyBackAvg    = 0;
+  let sellCloseAvg  = 0;
 
+  // 1. Buy back the short leg
   try {
-    await waitForOrderComplete(buyBackId, sellSymbol);
+    const result = await placeAndConfirm(sellSymbol, "BUY", quantity, index);
+    buyBackAvg = result.avgPrice;
   } catch (buyBackErr) {
-    // Buy-back failed — still try to close long, alert
-    condorLog(`🚨 Exit buy-back REJECTED (${sellSymbol}) — attempting to close long leg anyway`, "error");
+    condorLog(`🚨 Exit BUY-BACK failed (${sellSymbol}): ${buyBackErr.message}`, "error");
+    await sendCondorAlert(`🚨 <b>EXIT WARNING</b>
+Buy-back failed: ${sellSymbol}
+${buyBackErr.message}
+⚠️ Check Kite positions manually`);
   }
 
   // 2. Close the long leg
-  const sellCloseId = await placeKiteOrder(buySymbol, "SELL", quantity, index);
   try {
-    await waitForOrderComplete(sellCloseId, buySymbol);
+    const result = await placeAndConfirm(buySymbol, "SELL", quantity, index);
+    sellCloseAvg = result.avgPrice;
   } catch (sellCloseErr) {
-    condorLog(`🚨 Exit sell-close REJECTED (${buySymbol}) — manual intervention may be required`, "error");
+    condorLog(`🚨 Exit SELL-CLOSE failed (${buySymbol}): ${sellCloseErr.message}`, "error");
+    await sendCondorAlert(`🚨 <b>EXIT FAILURE</b>
+Sell-close failed: ${buySymbol}
+${sellCloseErr.message}
+⚠️ Manual intervention required in Kite`);
+  }
+
+  return { buyBackAvg, sellCloseAvg };
+};
+
+// EXIT: close short (BUY back) first confirmed, then close long (SELL) confirmed
+// If any leg fails — alert on Telegram, do not retry
+const exitSpread = async (sellSymbol, buySymbol, quantity, index) => {
+  // 1. Buy back the short leg
+  try {
+    await placeAndConfirm(sellSymbol, "BUY", quantity, index);
+  } catch (buyBackErr) {
+    condorLog(`🚨 Exit BUY-BACK failed (${sellSymbol}): ${buyBackErr.message} — attempting long leg close anyway`, "error");
+    await sendCondorAlert(`🚨 <b>EXIT WARNING</b>
+Buy-back failed: ${sellSymbol}
+${buyBackErr.message}
+⚠️ Check Kite positions manually`);
+  }
+
+  // 2. Close the long leg
+  try {
+    await placeAndConfirm(buySymbol, "SELL", quantity, index);
+  } catch (sellCloseErr) {
+    condorLog(`🚨 Exit SELL-CLOSE failed (${buySymbol}): ${sellCloseErr.message} — manual intervention required`, "error");
+    await sendCondorAlert(`🚨 <b>EXIT FAILURE</b>
+Sell-close failed: ${buySymbol}
+${sellCloseErr.message}
+⚠️ Manual intervention required in Kite`);
   }
 };
 
 // ─── ENTER IRON CONDOR ────────────────────────────────────────────────────────
-export const enterIronCondor = async (index, quantity, mode = "SEMI_AUTO") => {
+// side: "both" (default) | "call" | "put"
+// Entry premiums saved from actual Kite filled prices — not LTP
+// If put spread fails after call spread entered — exit call spread immediately
+// No retry ever — on any failure stop and alert
+export const enterIronCondor = async (index, quantity, mode = "SEMI_AUTO", side = "both") => {
   const ActiveTrade = getActiveTradeModel();
 
   const existing = await ActiveTrade.findOne({ status: { $in: ["ACTIVE", "EXITING"] } });
@@ -434,27 +477,67 @@ export const enterIronCondor = async (index, quantity, mode = "SEMI_AUTO") => {
   const strikes = await fetchFullOptionChain(index, expiry);
   const sel     = selectCondorStrikes(strikes, spot, index);
 
-  const callSellSym = buildKiteSymbol(index, expiry, sel.callSell.strike, "CE");
-  const callBuySym  = buildKiteSymbol(index, expiry, sel.callBuy.strike,  "CE");
-  const putSellSym  = buildKiteSymbol(index, expiry, sel.putSell.strike,  "PE");
-  const putBuySym   = buildKiteSymbol(index, expiry, sel.putBuy.strike,   "PE");
+  const enterCall = side === "both" || side === "call";
+  const enterPut  = side === "both" || side === "put";
 
-  cacheAndSubscribe(callSellSym, sel.callSell.callKey);
-  cacheAndSubscribe(callBuySym,  sel.callBuy.callKey);
-  cacheAndSubscribe(putSellSym,  sel.putSell.putKey);
-  cacheAndSubscribe(putBuySym,   sel.putBuy.putKey);  const callOrders = await enterSpread(callSellSym, callBuySym, quantity, index);
-  const putOrders  = await enterSpread(putSellSym,  putBuySym,  quantity, index);
+  const callSellSym = enterCall ? buildKiteSymbol(index, expiry, sel.callSell.strike, "CE") : null;
+  const callBuySym  = enterCall ? buildKiteSymbol(index, expiry, sel.callBuy.strike,  "CE") : null;
+  const putSellSym  = enterPut  ? buildKiteSymbol(index, expiry, sel.putSell.strike,  "PE") : null;
+  const putBuySym   = enterPut  ? buildKiteSymbol(index, expiry, sel.putBuy.strike,   "PE") : null;
 
-  const callEntry  = Math.max(0, sel.callSell.callLtp - sel.callBuy.callLtp);
-  const putEntry   = Math.max(0, sel.putSell.putLtp   - sel.putBuy.putLtp);
+  if (enterCall) {
+    cacheAndSubscribe(callSellSym, sel.callSell.callKey);
+    cacheAndSubscribe(callBuySym,  sel.callBuy.callKey);
+  }
+  if (enterPut) {
+    cacheAndSubscribe(putSellSym, sel.putSell.putKey);
+    cacheAndSubscribe(putBuySym,  sel.putBuy.putKey);
+  }
+
+  // Enter call spread first
+  let callOrders = null;
+  if (enterCall) {
+    callOrders = await enterSpread(callSellSym, callBuySym, quantity, index);
+  }
+
+  // Enter put spread — if fails and call was entered, rollback call spread immediately
+  let putOrders = null;
+  if (enterPut) {
+    try {
+      putOrders = await enterSpread(putSellSym, putBuySym, quantity, index);
+    } catch (putErr) {
+      if (callOrders) {
+        condorLog(`🚨 Put spread failed — rolling back call spread`, "error");
+        await sendCondorAlert(`🚨 <b>ENTRY FAILED</b> · ${index}
+Put spread failed: ${putErr.message}
+Rolling back call spread — check Kite positions`);
+        try { await exitSpread(callSellSym, callBuySym, quantity, index); } catch (_) {}
+      }
+      throw new Error(`Entry aborted — put spread failed: ${putErr.message}`);
+    }
+  }
+
+  // Save actual filled prices from Kite — not LTP
+  const callEntry  = callOrders ? callOrders.actualNet : 0;
+  const putEntry   = putOrders  ? putOrders.actualNet  : 0;
   const totalEntry = callEntry + putEntry;
 
   const trade = await ActiveTrade.create({
     index,
     status:   "ACTIVE",
     mode,
-    symbols:  { callSell: callSellSym, callBuy: callBuySym, putSell: putSellSym, putBuy: putBuySym },
-    orderIds: { callSell: callOrders.sellId, callBuy: callOrders.buyId, putSell: putOrders.sellId, putBuy: putOrders.buyId },
+    symbols:  {
+      callSell: callSellSym,
+      callBuy:  callBuySym,
+      putSell:  putSellSym,
+      putBuy:   putBuySym,
+    },
+    orderIds: {
+      callSell: callOrders?.sellId || null,
+      callBuy:  callOrders?.buyId  || null,
+      putSell:  putOrders?.sellId  || null,
+      putBuy:   putOrders?.buyId   || null,
+    },
     callSpreadEntryPremium: callEntry,
     putSpreadEntryPremium:  putEntry,
     totalEntryPremium:      totalEntry,
@@ -466,14 +549,101 @@ export const enterIronCondor = async (index, quantity, mode = "SEMI_AUTO") => {
   });
 
   await sendCondorAlert(
-    `🦅 <b>Iron Condor ENTERED</b> · ${index} · ${mode}\n` +
-    `Call: SELL ${callSellSym} / BUY ${callBuySym} · Net: <b>${callEntry.toFixed(2)}</b>\n` +
-    `Put:  SELL ${putSellSym} / BUY ${putBuySym} · Net: <b>${putEntry.toFixed(2)}</b>\n` +
+    `🦅 <b>Iron Condor ENTERED</b> · ${index} · ${mode} · ${side.toUpperCase()} side\n` +
+    (enterCall ? `Call: SELL ${callSellSym} / BUY ${callBuySym} · Net: <b>${callEntry.toFixed(2)}</b>\n` : "") +
+    (enterPut  ? `Put:  SELL ${putSellSym} / BUY ${putBuySym} · Net: <b>${putEntry.toFixed(2)}</b>\n`  : "") +
     `Total: <b>${totalEntry.toFixed(2)}</b> · Qty: ${quantity} · Expiry: ${expiry}`
   );
 
-  condorLog(`🦅 ENTERED ${index} | Call ${callSellSym}/${callBuySym} net=${callEntry.toFixed(2)} | Put ${putSellSym}/${putBuySym} net=${putEntry.toFixed(2)} | Total=${totalEntry.toFixed(2)} qty=${quantity}`, "success");
-  console.log(`✅ Iron Condor entered ${index} call=${callEntry.toFixed(2)} put=${putEntry.toFixed(2)}`);
+  condorLog(`🦅 ENTERED ${index} | side=${side} | call=${callEntry.toFixed(2)} put=${putEntry.toFixed(2)} total=${totalEntry.toFixed(2)} qty=${quantity}`, "success");
+  return trade;
+};
+
+// ─── IMPORT FROM KITE ─────────────────────────────────────────────────────────
+// If you entered manually in Kite broker app — call this to fetch your open
+// positions, save actual filled prices to DB, and start monitoring.
+// Supports one side (call only / put only) or both sides.
+export const importTradeFromKite = async (index, quantity, mode = "SEMI_AUTO") => {
+  const ActiveTrade = getActiveTradeModel();
+
+  const existing = await ActiveTrade.findOne({ status: { $in: ["ACTIVE", "EXITING"] } });
+  if (existing) throw new Error("Active trade already exists in DB — exit first");
+
+  const kc       = getKiteInstance();
+  const exchange = index === "SENSEX" ? "BFO" : "NFO";
+  const expiry   = getNearestExpiry(index);
+
+  // Fetch open positions from Kite
+  const positions = await kc.getPositions();
+  const openLegs  = (positions?.net || []).filter(
+    p => p.exchange === exchange && p.quantity !== 0
+  );
+
+  if (openLegs.length === 0)
+    throw new Error(`No open positions found in Kite for ${index} (${exchange})`);
+
+  // Find call sell, call buy, put sell, put buy from open positions
+  // sell leg = negative quantity (short), buy leg = positive quantity (long)
+  const callLegs = openLegs.filter(p => p.tradingsymbol.endsWith("CE"));
+  const putLegs  = openLegs.filter(p => p.tradingsymbol.endsWith("PE"));
+
+  const callSell = callLegs.find(p => p.quantity < 0) || null;
+  const callBuy  = callLegs.find(p => p.quantity > 0) || null;
+  const putSell  = putLegs.find(p => p.quantity < 0)  || null;
+  const putBuy   = putLegs.find(p => p.quantity > 0)  || null;
+
+  if (!callSell && !putSell)
+    throw new Error(`No short legs found in Kite for ${index} — cannot identify spreads`);
+
+  // Actual entry premiums from Kite avg prices
+  // sell avg − buy avg = net premium collected
+  const callEntry = (callSell && callBuy)
+    ? Math.max(0, callSell.sell_value / Math.abs(callSell.quantity) - callBuy.buy_value / callBuy.quantity)
+    : 0;
+  const putEntry = (putSell && putBuy)
+    ? Math.max(0, putSell.sell_value / Math.abs(putSell.quantity) - putBuy.buy_value / putBuy.quantity)
+    : 0;
+  const totalEntry = callEntry + putEntry;
+
+  // Subscribe to live prices for all legs
+  const instruments = await kc.getInstruments([exchange]);
+  const findToken = (sym) => instruments.find(i => i.tradingsymbol === sym)?.instrument_token || null;
+
+  if (callSell) cacheAndSubscribe(callSell.tradingsymbol, findToken(callSell.tradingsymbol));
+  if (callBuy)  cacheAndSubscribe(callBuy.tradingsymbol,  findToken(callBuy.tradingsymbol));
+  if (putSell)  cacheAndSubscribe(putSell.tradingsymbol,  findToken(putSell.tradingsymbol));
+  if (putBuy)   cacheAndSubscribe(putBuy.tradingsymbol,   findToken(putBuy.tradingsymbol));
+
+  const trade = await ActiveTrade.create({
+    index,
+    status:   "ACTIVE",
+    mode,
+    symbols: {
+      callSell: callSell?.tradingsymbol || null,
+      callBuy:  callBuy?.tradingsymbol  || null,
+      putSell:  putSell?.tradingsymbol  || null,
+      putBuy:   putBuy?.tradingsymbol   || null,
+    },
+    orderIds: { callSell: null, callBuy: null, putSell: null, putBuy: null },
+    callSpreadEntryPremium: callEntry,
+    putSpreadEntryPremium:  putEntry,
+    totalEntryPremium:      totalEntry,
+    quantity,
+    expiry,
+    bufferPremium:   0,
+    slCount:         0,
+    isIronButterfly: false,
+  });
+
+  await sendCondorAlert(
+    `📥 <b>Trade Imported from Kite</b> · ${index} · ${mode}\n` +
+    (callSell ? `Call: SELL ${callSell.tradingsymbol} / BUY ${callBuy?.tradingsymbol} · Net: <b>${callEntry.toFixed(2)}</b>\n` : "Call: not entered\n") +
+    (putSell  ? `Put:  SELL ${putSell.tradingsymbol}  / BUY ${putBuy?.tradingsymbol}  · Net: <b>${putEntry.toFixed(2)}</b>\n`  : "Put: not entered\n") +
+    `Total: <b>${totalEntry.toFixed(2)}</b> · Qty: ${quantity} · Expiry: ${expiry}\n` +
+    `Monitoring started`
+  );
+
+  condorLog(`📥 IMPORTED ${index} | call=${callEntry.toFixed(2)} put=${putEntry.toFixed(2)} total=${totalEntry.toFixed(2)} qty=${quantity}`, "success");
   return trade;
 };
 
@@ -519,21 +689,26 @@ export const exitAllLegs = async (trade, reason) => {
 export const executeFirefight = async (trade, profitSide) => {
   const ActiveTrade = getActiveTradeModel();
 
-  const profitEntry  = profitSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
-  const profitNet    = profitSide === "call" ? getCallNet(trade) : getPutNet(trade);
-  const profitBooked = Math.max(0, profitEntry - profitNet);
-  const newBuffer    = (trade.bufferPremium || 0) + profitBooked;
-  const losingSide   = profitSide === "call" ? "put" : "call";
+  const profitEntry = profitSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
+  const losingSide  = profitSide === "call" ? "put" : "call";
 
-  console.log(`⚔️ Firefight: exit ${profitSide} net=${profitNet.toFixed(2)} booked=${profitBooked.toFixed(2)}`);
-  condorLog(`⚔️ FIREFIGHT triggered | exit ${profitSide} side | net=${profitNet.toFixed(2)} booked=₹${profitBooked.toFixed(2)}`, "warn");
+  condorLog(`⚔️ FIREFIGHT triggered | exit ${profitSide} side | entry=${profitEntry.toFixed(2)}`, "warn");
 
-  // 1. Exit profit side
-  if (profitSide === "call") {
-    await exitSpread(trade.symbols.callSell, trade.symbols.callBuy, trade.quantity, trade.index);
-  } else {
-    await exitSpread(trade.symbols.putSell, trade.symbols.putBuy, trade.quantity, trade.index);
-  }
+  // 1. Exit profit side — get actual filled prices from Kite
+  const profitSellSym = profitSide === "call" ? trade.symbols.callSell : trade.symbols.putSell;
+  const profitBuySym  = profitSide === "call" ? trade.symbols.callBuy  : trade.symbols.putBuy;
+
+  // exitSpread returns actual fill prices — buyBack avg and sellClose avg
+  const exitResult = await exitSpreadWithFill(profitSellSym, profitBuySym, trade.quantity, trade.index);
+
+  // actual premium received on exit = what we paid to close sell leg (buyBack) minus what we received to close buy leg (sellClose)
+  // net cost to close = exitResult.buyBackAvg - exitResult.sellCloseAvg
+  // actual profit booked = entry premium - net cost to close
+  const exitNetCost   = Math.max(0, exitResult.buyBackAvg - exitResult.sellCloseAvg);
+  const profitBooked  = Math.max(0, profitEntry - exitNetCost);
+  const newBuffer     = (trade.bufferPremium || 0) + profitBooked;
+
+  console.log(`⚔️ Firefight exit: buyBackAvg=${exitResult.buyBackAvg} sellCloseAvg=${exitResult.sellCloseAvg} exitNetCost=${exitNetCost.toFixed(2)} booked=${profitBooked.toFixed(2)}`);
 
   // 2. Fresh chain → find replacement
   const spot        = await getSpotPrice(trade.index);
@@ -552,43 +727,41 @@ export const executeFirefight = async (trade, profitSide) => {
     cacheAndSubscribe(newBuySym,  replacement.buy.putKey);
   }
 
-  // 3. Enter new spread — BUY first, SELL second
+  // 3. Enter new spread — actual filled price from Kite
   const newOrders = await enterSpread(newSellSym, newBuySym, trade.quantity, trade.index);
+  const newEntry  = newOrders.actualNet; // actual fill from Kite
 
   // 4. Update DB
   const losingEntry = profitSide === "call" ? trade.putSpreadEntryPremium : trade.callSpreadEntryPremium;
   const newSL       = slLevel(losingEntry, newBuffer);
 
   const upd = {
-    bufferPremium:     newBuffer,
-    firefightPending:  false,
-    firefightSide:     null,
-    // ✅ FIX: totalEntryPremium was computed incorrectly — both ternaries used
-    //         profitSide which caused the losing side's premium to be added twice
-    //         when profitSide="call". Fixed to use correct side for each term.
+    bufferPremium:    newBuffer,
+    firefightPending: false,
+    firefightSide:    null,
     totalEntryPremium:
-      (profitSide === "call" ? replacement.net              : trade.callSpreadEntryPremium) +
-      (profitSide === "put"  ? replacement.net              : trade.putSpreadEntryPremium),
+      (profitSide === "call" ? newEntry                       : trade.callSpreadEntryPremium) +
+      (profitSide === "put"  ? newEntry                       : trade.putSpreadEntryPremium),
   };
   if (profitSide === "call") {
     upd["symbols.callSell"]       = newSellSym;
     upd["symbols.callBuy"]        = newBuySym;
     upd["orderIds.callSell"]      = newOrders.sellId;
     upd["orderIds.callBuy"]       = newOrders.buyId;
-    upd["callSpreadEntryPremium"] = replacement.net;
+    upd["callSpreadEntryPremium"] = newEntry;
   } else {
     upd["symbols.putSell"]        = newSellSym;
     upd["symbols.putBuy"]         = newBuySym;
     upd["orderIds.putSell"]       = newOrders.sellId;
     upd["orderIds.putBuy"]        = newOrders.buyId;
-    upd["putSpreadEntryPremium"]  = replacement.net;
+    upd["putSpreadEntryPremium"]  = newEntry;
   }
   await ActiveTrade.updateOne({ _id: trade._id }, { $set: upd });
 
   await sendCondorAlert(
     `⚔️ <b>FIREFIGHT DONE</b> · ${trade.index}\n` +
     `Exited ${profitSide} · Booked: <b>${profitBooked.toFixed(2)}</b> · Buffer: <b>${newBuffer.toFixed(2)}</b>\n` +
-    `New ${profitSide}: SELL ${newSellSym} / BUY ${newBuySym} · Net: <b>${replacement.net.toFixed(2)}</b>\n` +
+    `New ${profitSide}: SELL ${newSellSym} / BUY ${newBuySym} · Net: <b>${newEntry.toFixed(2)}</b>\n` +
     `${losingSide} SL now: <b>${newSL.toFixed(2)}</b>`
   );
   condorLog(`⚔️ FIREFIGHT DONE ${trade.index} | new ${profitSide}: ${newSellSym}/${newBuySym} net=${replacement.net.toFixed(2)} | buffer=₹${newBuffer.toFixed(2)}`, "success");

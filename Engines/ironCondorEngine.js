@@ -1376,12 +1376,13 @@ export const scanAndSyncOrders = async () => {
 };
 
 // ─── reconcileKitePositions ───────────────────────────────────────────────────
-// Runs every 60 seconds — fetches Kite REST positions + orders for reconciliation.
-// Keeps cached P&L data fresh without hammering the REST API every second.
+// Runs every 60 seconds from server.js.
+// Two jobs:
+//   1. If active trade exists → refresh cached P&L data from Kite REST
+//   2. If NO active trade in DB → check if manual positions exist in Kite → auto-import
 export const reconcileKitePositions = async () => {
   const ActiveTrade = getActiveTradeModel();
-  const trade = await ActiveTrade.findOne({ status: "ACTIVE" });
-  if (!trade) return;
+  const trade = await ActiveTrade.findOne({ status: { $in: ["ACTIVE", "EXITING"] } });
 
   try {
     const kc = getKiteInstance();
@@ -1389,9 +1390,113 @@ export const reconcileKitePositions = async () => {
       kc.getPositions(),
       kc.getOrders(),
     ]);
-    updateKitePositions(pos?.net || []);
+    const netPositions = pos?.net || [];
+    updateKitePositions(netPositions);
     updateKiteOrders(orders || []);
-    console.log("🔄 Kite positions reconciled");
+
+    // ── Job 1: existing trade — just refresh cache ────────────────────────
+    if (trade) {
+      console.log("🔄 Kite positions reconciled");
+      return;
+    }
+
+    // ── Job 2: no active trade — check for manual positions in Kite ───────
+    // Only run during market hours to avoid ghost detection
+    const now  = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+    const mins = now.getHours() * 60 + now.getMinutes();
+    const isMarketHours = now.getDay() >= 1 && now.getDay() <= 5 && mins >= 555 && mins < 930;
+    if (!isMarketHours) return;
+
+    // Find open option legs across both exchanges
+    const openLegs = netPositions.filter(p =>
+      (p.exchange === "NFO" || p.exchange === "BFO") && p.quantity !== 0
+    );
+    if (openLegs.length === 0) return;
+
+    // Determine index from exchange
+    const hasBFO = openLegs.some(p => p.exchange === "BFO");
+    const hasNFO = openLegs.some(p => p.exchange === "NFO");
+
+    // Handle one index at a time — if both found take SENSEX first (BFO)
+    const exchange = hasBFO ? "BFO" : "NFO";
+    const index    = exchange === "BFO" ? "SENSEX" : "NIFTY";
+    const legs     = openLegs.filter(p => p.exchange === exchange);
+
+    const callLegs = legs.filter(p => p.tradingsymbol.endsWith("CE"));
+    const putLegs  = legs.filter(p => p.tradingsymbol.endsWith("PE"));
+    const callSell = callLegs.find(p => p.quantity < 0) || null;
+    const callBuy  = callLegs.find(p => p.quantity > 0) || null;
+    const putSell  = putLegs.find(p => p.quantity < 0)  || null;
+    const putBuy   = putLegs.find(p => p.quantity > 0)  || null;
+
+    // Must have at least one complete spread (sell + buy same type)
+    const hasCallSpread = !!(callSell && callBuy);
+    const hasPutSpread  = !!(putSell  && putBuy);
+    if (!hasCallSpread && !hasPutSpread) return;
+
+    // Quantity from actual Kite position
+    const quantity = Math.abs(
+      hasCallSpread ? callSell.quantity : putSell.quantity
+    );
+
+    // Entry premiums from actual Kite avg prices
+    const callEntry = hasCallSpread
+      ? Math.max(0, callSell.sell_value / Math.abs(callSell.quantity) - callBuy.buy_value / callBuy.quantity)
+      : 0;
+    const putEntry = hasPutSpread
+      ? Math.max(0, putSell.sell_value / Math.abs(putSell.quantity) - putBuy.buy_value / putBuy.quantity)
+      : 0;
+
+    // positionType based on what was found
+    const positionType = hasCallSpread && hasPutSpread ? "IRON_CONDOR"
+                       : hasCallSpread                 ? "ONE_SIDE_CALL"
+                       :                                 "ONE_SIDE_PUT";
+
+    // Subscribe to live prices for all found legs
+    const instruments = await kc.getInstruments([exchange]);
+    const findToken   = (sym) => instruments.find(i => i.tradingsymbol === sym)?.instrument_token || null;
+    if (callSell) cacheAndSubscribe(callSell.tradingsymbol, findToken(callSell.tradingsymbol));
+    if (callBuy)  cacheAndSubscribe(callBuy.tradingsymbol,  findToken(callBuy.tradingsymbol));
+    if (putSell)  cacheAndSubscribe(putSell.tradingsymbol,  findToken(putSell.tradingsymbol));
+    if (putBuy)   cacheAndSubscribe(putBuy.tradingsymbol,   findToken(putBuy.tradingsymbol));
+
+    const expiry = getNearestExpiry(index);
+    const mode   = process.env.DEFAULT_MODE || "SEMI_AUTO";
+
+    await ActiveTrade.create({
+      index,
+      status:                 "ACTIVE",
+      mode,
+      positionType,
+      symbols: {
+        callSell: callSell?.tradingsymbol || null,
+        callBuy:  callBuy?.tradingsymbol  || null,
+        putSell:  putSell?.tradingsymbol  || null,
+        putBuy:   putBuy?.tradingsymbol   || null,
+      },
+      orderIds: { callSell: null, callBuy: null, putSell: null, putBuy: null },
+      callSpreadEntryPremium: callEntry,
+      putSpreadEntryPremium:  putEntry,
+      totalEntryPremium:      callEntry + putEntry,
+      quantity,
+      expiry,
+      bufferPremium:   0,
+      slCount:         0,
+      isIronButterfly: false,
+    });
+
+    await sendCondorAlert(
+      `📡 <b>Auto-Detected from Kite</b> · ${index} · ${positionType}
+` +
+      (hasCallSpread ? `Call: SELL ${callSell.tradingsymbol} / BUY ${callBuy.tradingsymbol} · Net: <b>${callEntry.toFixed(2)}</b>
+` : "") +
+      (hasPutSpread  ? `Put:  SELL ${putSell.tradingsymbol}  / BUY ${putBuy.tradingsymbol}  · Net: <b>${putEntry.toFixed(2)}</b>
+`  : "") +
+      `Qty: ${quantity} · Mode: ${mode}
+Monitoring started automatically`
+    );
+    condorLog(`📡 AUTO-DETECTED ${index} | positionType=${positionType} | call=${callEntry.toFixed(2)} put=${putEntry.toFixed(2)} qty=${quantity}`, "success");
+
   } catch (e) {
     console.error("❌ Kite reconcile error:", e.message);
   }

@@ -276,14 +276,14 @@ export const autoEnterIfNeeded = async () => {
 
     const quantity = lots * lotSize;
     condorLog(`🚀 Auto entry starting | ${index} | ${lots} lots × ${lotSize} = ${quantity} qty`, "info");
+    // Lock entryDone BEFORE attempt — no retry ever on failure
+    _state.entryDone = true;
     try {
       await enterIronCondor(index, quantity, "FULL_AUTO");
-      // ✅ FIX: only mark entryDone on success — allows retry within 9:30–9:45 window if entry fails
-      _state.entryDone = true;
     } catch (err) {
       console.error(`❌ Auto entry ${index}:`, err.message);
-      condorLog(`❌ Auto entry FAILED | ${index} | ${err.message} — will retry next tick`, "error");
-      await sendCondorAlert(`❌ <b>Auto entry failed</b> · ${index}\n<code>${err.message}</code>\nWill retry within entry window.`);
+      condorLog(`❌ Auto entry FAILED | ${index} | ${err.message} — manual intervention required`, "error");
+      await sendCondorAlert(`❌ <b>Auto entry FAILED</b> · ${index}\n<code>${err.message}</code>\n⚠️ No retry — check Kite positions manually`);
     }
   }
 };

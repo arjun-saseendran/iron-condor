@@ -57,6 +57,23 @@ const schema = new mongoose.Schema(
     slBookedLoss: { type: Number, default: 0 },
 
     enteredAt: { type: Date, default: Date.now },
+
+    // ─── One-side position fields ─────────────────────────────────────────────
+    // positionType drives _checkConditions routing — set at entry, updated when structure changes
+    // ONE_SIDE_CALL → only call spread active (manual entry)
+    // ONE_SIDE_PUT  → only put spread active (manual entry)
+    // IRON_CONDOR   → both sides active (normal or after opposite side entered)
+    // IRON_BUTTERFLY → converted from condor on expiry day
+    positionType: {
+      type:    String,
+      enum:    ["ONE_SIDE_CALL", "ONE_SIDE_PUT", "IRON_CONDOR", "IRON_BUTTERFLY"],
+      default: "IRON_CONDOR",
+    },
+
+    // Set to true when one-side hits 3x loss in SEMI_AUTO — shows dashboard button
+    oppositeSidePending: { type: Boolean, default: false },
+    // Which side to enter — "call" or "put"
+    oppositeSide:        { type: String,  default: null },
   },
   { timestamps: true }
 );

@@ -522,10 +522,16 @@ Rolling back call spread — check Kite positions`);
   const putEntry   = putOrders  ? putOrders.actualNet  : 0;
   const totalEntry = callEntry + putEntry;
 
+  // positionType drives _checkConditions routing — set once at entry, updated when structure changes
+  const positionType = side === "call" ? "ONE_SIDE_CALL"
+                     : side === "put"  ? "ONE_SIDE_PUT"
+                     : "IRON_CONDOR";
+
   const trade = await ActiveTrade.create({
     index,
     status:   "ACTIVE",
     mode,
+    positionType,
     symbols:  {
       callSell: callSellSym,
       callBuy:  callBuySym,
@@ -993,10 +999,185 @@ onPriceUpdate(async (instrumentToken, ltp) => {
   }
 });
 
+// ─── ONE SIDE CHECKER ────────────────────────────────────────────────────────
+// Called when positionType is ONE_SIDE_CALL or ONE_SIDE_PUT.
+// Rules:
+//   30% decay  → book profit, enter fresh OTM same side, buffer grows (same as condor firefight same-side)
+//   3x loss    → SEMI_AUTO: Telegram alert + dashboard suggestion to enter opposite side
+//              → FULL_AUTO: enter opposite side confirmed from Kite → positionType = IRON_CONDOR
+//   SL (4x+buffer) → same slLevel() function, reset same side to fresh OTM
+// All orders confirmed from Kite before any state change.
+const _checkOneSide = async (trade) => {
+  const ActiveTrade = getActiveTradeModel();
+  const side   = trade.positionType === "ONE_SIDE_CALL" ? "call" : "put";
+  const oppSide = side === "call" ? "put" : "call";
+
+  const net    = side === "call" ? getCallNet(trade) : getPutNet(trade);
+  const entry  = side === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
+  const buffer = trade.bufferPremium || 0;
+
+  // ── 30% decay → book profit, enter fresh OTM same side ───────────────────
+  if (net <= firefightProfitLevel(entry)) {
+    condorLog(`💰 ONE-SIDE PROFIT | ${side} decayed to ${net.toFixed(2)} (entry=${entry.toFixed(2)}) — booking profit, rolling same side`, "warn");
+
+    const sellSym = side === "call" ? trade.symbols.callSell : trade.symbols.putSell;
+    const buySym  = side === "call" ? trade.symbols.callBuy  : trade.symbols.putBuy;
+
+    // Exit current spread — actual fill from Kite
+    const exitResult  = await exitSpreadWithFill(sellSym, buySym, trade.quantity, trade.index);
+    const exitNetCost = Math.max(0, exitResult.buyBackAvg - exitResult.sellCloseAvg);
+    const booked      = Math.max(0, entry - exitNetCost);
+    const newBuffer   = buffer + booked;
+
+    // Enter fresh OTM same side — confirmed from Kite
+    const spot        = await getSpotPrice(trade.index);
+    const strikes     = await fetchFullOptionChain(trade.index, trade.expiry);
+    const replacement = findReplacementSpread(strikes, spot, trade.index, side);
+    const optType     = side === "call" ? "CE" : "PE";
+    const newSellSym  = buildKiteSymbol(trade.index, trade.expiry, replacement.sell.strike, optType);
+    const newBuySym   = buildKiteSymbol(trade.index, trade.expiry, replacement.buy.strike,  optType);
+
+    if (side === "call") {
+      cacheAndSubscribe(newSellSym, replacement.sell.callKey);
+      cacheAndSubscribe(newBuySym,  replacement.buy.callKey);
+    } else {
+      cacheAndSubscribe(newSellSym, replacement.sell.putKey);
+      cacheAndSubscribe(newBuySym,  replacement.buy.putKey);
+    }
+
+    // Confirmed from Kite before saving anything
+    const newOrders = await enterSpread(newSellSym, newBuySym, trade.quantity, trade.index);
+    const newEntry  = newOrders.actualNet;
+
+    const upd = {
+      bufferPremium: newBuffer,
+      totalEntryPremium: newEntry,
+    };
+    if (side === "call") {
+      upd["symbols.callSell"]       = newSellSym;
+      upd["symbols.callBuy"]        = newBuySym;
+      upd["orderIds.callSell"]      = newOrders.sellId;
+      upd["orderIds.callBuy"]       = newOrders.buyId;
+      upd["callSpreadEntryPremium"] = newEntry;
+    } else {
+      upd["symbols.putSell"]        = newSellSym;
+      upd["symbols.putBuy"]         = newBuySym;
+      upd["orderIds.putSell"]       = newOrders.sellId;
+      upd["orderIds.putBuy"]        = newOrders.buyId;
+      upd["putSpreadEntryPremium"]  = newEntry;
+    }
+    await ActiveTrade.updateOne({ _id: trade._id }, { $set: upd });
+
+    await sendCondorAlert(
+      `💰 <b>One-Side Profit Booked</b> · ${trade.index} · ${side}
+` +
+      `Booked: ₹${booked.toFixed(2)} · Buffer: ₹${newBuffer.toFixed(2)}
+` +
+      `New ${side}: SELL ${newSellSym} / BUY ${newBuySym} · Net: ${newEntry.toFixed(2)}`
+    );
+    condorLog(`💰 ONE-SIDE PROFIT ROLLED ${trade.index} | ${side} booked=₹${booked.toFixed(2)} buffer=₹${newBuffer.toFixed(2)} newEntry=${newEntry.toFixed(2)}`, "success");
+    return;
+  }
+
+  // ── 3x loss → suggest or auto-enter opposite side ────────────────────────
+  if (net >= firefightLossLevel(entry)) {
+    if (trade.mode === "FULL_AUTO") {
+      condorLog(`⚔️ ONE-SIDE 3x LOSS | ${side} at ${net.toFixed(2)} — entering opposite side ${oppSide} (FULL_AUTO)`, "warn");
+
+      const spot        = await getSpotPrice(trade.index);
+      const strikes     = await fetchFullOptionChain(trade.index, trade.expiry);
+      const replacement = findReplacementSpread(strikes, spot, trade.index, oppSide);
+      const optType     = oppSide === "call" ? "CE" : "PE";
+      const newSellSym  = buildKiteSymbol(trade.index, trade.expiry, replacement.sell.strike, optType);
+      const newBuySym   = buildKiteSymbol(trade.index, trade.expiry, replacement.buy.strike,  optType);
+
+      if (oppSide === "call") {
+        cacheAndSubscribe(newSellSym, replacement.sell.callKey);
+        cacheAndSubscribe(newBuySym,  replacement.buy.callKey);
+      } else {
+        cacheAndSubscribe(newSellSym, replacement.sell.putKey);
+        cacheAndSubscribe(newBuySym,  replacement.buy.putKey);
+      }
+
+      // Confirmed from Kite — only after this do we update DB
+      const newOrders = await enterSpread(newSellSym, newBuySym, trade.quantity, trade.index);
+      const newEntry  = newOrders.actualNet;
+
+      const upd = {
+        positionType: "IRON_CONDOR", // ✅ now full condor — all existing condor logic takes over
+        totalEntryPremium:
+          (oppSide === "call" ? newEntry : trade.callSpreadEntryPremium) +
+          (oppSide === "put"  ? newEntry : trade.putSpreadEntryPremium),
+      };
+      if (oppSide === "call") {
+        upd["symbols.callSell"]       = newSellSym;
+        upd["symbols.callBuy"]        = newBuySym;
+        upd["orderIds.callSell"]      = newOrders.sellId;
+        upd["orderIds.callBuy"]       = newOrders.buyId;
+        upd["callSpreadEntryPremium"] = newEntry;
+      } else {
+        upd["symbols.putSell"]        = newSellSym;
+        upd["symbols.putBuy"]         = newBuySym;
+        upd["orderIds.putSell"]       = newOrders.sellId;
+        upd["orderIds.putBuy"]        = newOrders.buyId;
+        upd["putSpreadEntryPremium"]  = newEntry;
+      }
+      await ActiveTrade.updateOne({ _id: trade._id }, { $set: upd });
+
+      await sendCondorAlert(
+        `⚔️ <b>One-Side → Iron Condor</b> · ${trade.index}
+` +
+        `${side} at 3x loss · Entered ${oppSide} side (confirmed Kite)
+` +
+        `${oppSide}: SELL ${newSellSym} / BUY ${newBuySym} · Net: ${newEntry.toFixed(2)}
+` +
+        `Now monitoring as full Iron Condor`
+      );
+      condorLog(`⚔️ ONE-SIDE → IRON_CONDOR ${trade.index} | entered ${oppSide} net=${newEntry.toFixed(2)} | positionType=IRON_CONDOR`, "success");
+
+    } else {
+      // SEMI_AUTO — alert only, show suggestion on dashboard
+      if (!trade.oppositeSidePending) {
+        await ActiveTrade.updateOne({ _id: trade._id }, { $set: { oppositeSidePending: true, oppositeSide: oppSide } });
+        await sendCondorAlert(
+          `⚠️ <b>One-Side 3x Loss</b> · ${trade.index} · ${side}
+` +
+          `net=${net.toFixed(2)} entry=${entry.toFixed(2)}
+` +
+          `Suggestion: Enter ${oppSide.toUpperCase()} side now
+` +
+          `Click on dashboard to confirm`
+        );
+        condorLog(`⚠️ ONE-SIDE 3x LOSS ALERT ${trade.index} | ${side} at 3x | suggest entering ${oppSide}`, "warn");
+      }
+    }
+    return;
+  }
+
+  // ── SL (4x + buffer) → reset same side to fresh OTM ─────────────────────
+  const sl    = slLevel(entry, buffer);
+  const slHit = net >= sl;
+  if (slHit) {
+    condorLog(`🔴 ONE-SIDE SL HIT | ${side} net=${net.toFixed(2)} sl=${sl.toFixed(2)} slCount=${trade.slCount}`, "error");
+    // Re-use existing executeSLReset — same logic, exits losing side, enters fresh OTM same side
+    await executeSLReset(trade, side);
+  }
+};
+
 // ─── CONDITION CHECKER ───────────────────────────────────────────────────────
 const _checkConditions = async (trade) => {
-  const callNet    = getCallNet(trade);
-  const putNet     = getPutNet(trade);
+  // Route one-side positions to their own checker — avoids wrong condor logic firing
+  if (trade.positionType === "ONE_SIDE_CALL" || trade.positionType === "ONE_SIDE_PUT") {
+    return _checkOneSide(trade);
+  }
+
+  const hasCall = !!(trade.symbols.callSell && trade.symbols.callBuy && trade.callSpreadEntryPremium > 0);
+  const hasPut  = !!(trade.symbols.putSell  && trade.symbols.putBuy  && trade.putSpreadEntryPremium  > 0);
+
+  if (!hasCall && !hasPut) return;
+
+  const callNet    = hasCall ? getCallNet(trade) : null;
+  const putNet     = hasPut  ? getPutNet(trade)  : null;
   const buffer     = trade.bufferPremium || 0;
   const callEntry  = trade.callSpreadEntryPremium;
   const putEntry   = trade.putSpreadEntryPremium;
@@ -1008,6 +1189,7 @@ const _checkConditions = async (trade) => {
   //   bfSL = (losingEntry × 5) + newEntry + buffer
   // On every tick: if live (callNet + putNet) >= bfSL → real loss = 2% → exit.
   if (trade.isIronButterfly) {
+    if (!hasCall || !hasPut) return; // butterfly needs both sides
     const bfSL  = trade.butterflySL;
     const bfNet = callNet + putNet;
     if (bfNet >= bfSL) {
@@ -1025,15 +1207,16 @@ const _checkConditions = async (trade) => {
   // callLosing = call is losing → put is the profit side → check put's profit level
   // putLosing  = put is losing  → call is the profit side → check call's profit level
   // Confirmed logic is correct as written.
-  const callLosing = callNet >= firefightLossLevel(callEntry) && putNet  <= firefightProfitLevel(putEntry);
-  const putLosing  = putNet  >= firefightLossLevel(putEntry)  && callNet <= firefightProfitLevel(callEntry);
+  // Firefight only possible when both sides exist
+  const callLosing = hasCall && hasPut && callNet >= firefightLossLevel(callEntry) && putNet  <= firefightProfitLevel(putEntry);
+  const putLosing  = hasCall && hasPut && putNet  >= firefightLossLevel(putEntry)  && callNet <= firefightProfitLevel(callEntry);
 
   // ✅ NEW: Post-SL single-side firefight logic
   // After slCount=1 and postSlFirefightDone=false:
   //   If profit side reaches 70% decay (net ≤ entry × 0.30) → firefight that side ALONE
   //   No need to wait for losing side to reach 3x — market is trending, lock profit now
   // After post-SL firefight done → postSlFirefightDone=true → resume normal dual-condition rules
-  if (trade.slCount >= 1 && !trade.postSlFirefightDone) {
+  if (trade.slCount >= 1 && !trade.postSlFirefightDone && hasCall && hasPut) {
     const callDecayed = callNet <= firefightProfitLevel(callEntry);
     const putDecayed  = putNet  <= firefightProfitLevel(putEntry);
 
@@ -1087,10 +1270,11 @@ const _checkConditions = async (trade) => {
   }
 
   // ── Spread SL (both modes — SL always automated) ────────────────────────────
-  const callSL    = slLevel(callEntry, buffer);
-  const putSL     = slLevel(putEntry,  buffer);
-  const callSLHit = callNet >= callSL;
-  const putSLHit  = putNet  >= putSL;
+  // Only check SL for sides that actually exist — null side skipped
+  const callSL    = hasCall ? slLevel(callEntry, buffer) : Infinity;
+  const putSL     = hasPut  ? slLevel(putEntry,  buffer) : Infinity;
+  const callSLHit = hasCall && callNet >= callSL;
+  const putSLHit  = hasPut  && putNet  >= putSL;
 
   if (callSLHit || putSLHit) {
     // ✅ FIX: if both SLs hit simultaneously (gap open scenario), treat as 2nd SL
@@ -1113,14 +1297,17 @@ export const scanAndSyncOrders = async () => {
   const trade = await ActiveTrade.findOne({ status: "ACTIVE" });
   if (!trade) return;
 
-  const callNet    = getCallNet(trade);
-  const putNet     = getPutNet(trade);
+  const hasCall    = !!(trade.symbols.callSell && trade.symbols.callBuy && trade.callSpreadEntryPremium > 0);
+  const hasPut     = !!(trade.symbols.putSell  && trade.symbols.putBuy  && trade.putSpreadEntryPremium  > 0);
+  const callNet    = hasCall ? getCallNet(trade) : 0;
+  const putNet     = hasPut  ? getPutNet(trade)  : 0;
   const buffer     = trade.bufferPremium || 0;
   const callEntry  = trade.callSpreadEntryPremium;
   const putEntry   = trade.putSpreadEntryPremium;
 
   // P&L from live WebSocket prices — no REST needed
-  const livePnL = ((callEntry - callNet) + (putEntry - putNet)) * trade.quantity;
+  const livePnL = (hasCall ? (callEntry - callNet) : 0) * trade.quantity
+                + (hasPut  ? (putEntry  - putNet)  : 0) * trade.quantity;
   const kitePnl = getKitePnL(trade); // uses cached REST data updated by reconcileKitePositions
   const pnl     = kitePnl !== null ? kitePnl : livePnL;
 
@@ -1153,10 +1340,13 @@ export const scanAndSyncOrders = async () => {
         ff3x:           firefightLossLevel(putEntry).toFixed(2),
         ffProfit:       firefightProfitLevel(putEntry).toFixed(2),
       },
-      butterflySL:      trade.isIronButterfly ? trade.butterflySL?.toFixed(2) : null,
-      firefightPending: trade.firefightPending,
-      firefightSide:    trade.firefightSide,
-      butterflyPending: trade.butterflyPending,
+      butterflySL:         trade.isIronButterfly ? trade.butterflySL?.toFixed(2) : null,
+      firefightPending:    trade.firefightPending    || false,
+      firefightSide:       trade.firefightSide       || null,
+      butterflyPending:    trade.butterflyPending     || false,
+      oppositeSidePending: trade.oppositeSidePending  || false,
+      oppositeSide:        trade.oppositeSide         || null,
+      positionType:        trade.positionType         || "IRON_CONDOR",
     });
   }
 

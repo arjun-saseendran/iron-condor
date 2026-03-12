@@ -121,6 +121,66 @@ app.post("/api/engine/stop", async (_req, res) => {
   }
 });
 
+// ─── Enter opposite side (one-side → iron condor) ────────────────────────────
+// Called from dashboard when oppositeSidePending=true and user clicks confirm
+app.post("/api/trades/enter-opposite", async (req, res) => {
+  try {
+    const ActiveTrade = getActiveTradeModel();
+    const trade = await ActiveTrade.findOne({ status: "ACTIVE" });
+    if (!trade) return res.status(404).json({ error: "No active trade" });
+    if (!trade.oppositeSidePending) return res.status(400).json({ error: "No opposite side pending" });
+
+    const { enterSpread, findReplacementSpread, buildKiteSymbol, cacheAndSubscribe,
+            getSpotPrice, fetchFullOptionChain } = await import("./Engines/ironCondorEngine.js");
+
+    const oppSide   = trade.oppositeSide;
+    const spot      = await getSpotPrice(trade.index);
+    const strikes   = await fetchFullOptionChain(trade.index, trade.expiry);
+    const replacement = findReplacementSpread(strikes, spot, trade.index, oppSide);
+    const optType   = oppSide === "call" ? "CE" : "PE";
+    const newSellSym = buildKiteSymbol(trade.index, trade.expiry, replacement.sell.strike, optType);
+    const newBuySym  = buildKiteSymbol(trade.index, trade.expiry, replacement.buy.strike,  optType);
+
+    if (oppSide === "call") {
+      cacheAndSubscribe(newSellSym, replacement.sell.callKey);
+      cacheAndSubscribe(newBuySym,  replacement.buy.callKey);
+    } else {
+      cacheAndSubscribe(newSellSym, replacement.sell.putKey);
+      cacheAndSubscribe(newBuySym,  replacement.buy.putKey);
+    }
+
+    // Confirmed from Kite — only after this update DB
+    const newOrders = await enterSpread(newSellSym, newBuySym, trade.quantity, trade.index);
+    const newEntry  = newOrders.actualNet;
+
+    const upd = {
+      positionType:        "IRON_CONDOR",
+      oppositeSidePending: false,
+      oppositeSide:        null,
+      totalEntryPremium:
+        (oppSide === "call" ? newEntry : trade.callSpreadEntryPremium) +
+        (oppSide === "put"  ? newEntry : trade.putSpreadEntryPremium),
+    };
+    if (oppSide === "call") {
+      upd["symbols.callSell"]       = newSellSym;
+      upd["symbols.callBuy"]        = newBuySym;
+      upd["orderIds.callSell"]      = newOrders.sellId;
+      upd["orderIds.callBuy"]       = newOrders.buyId;
+      upd["callSpreadEntryPremium"] = newEntry;
+    } else {
+      upd["symbols.putSell"]        = newSellSym;
+      upd["symbols.putBuy"]         = newBuySym;
+      upd["orderIds.putSell"]       = newOrders.sellId;
+      upd["orderIds.putBuy"]        = newOrders.buyId;
+      upd["putSpreadEntryPremium"]  = newEntry;
+    }
+    await ActiveTrade.updateOne({ _id: trade._id }, { $set: upd });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Mode switch ─────────────────────────────────────────────────────────────
 app.post("/api/trades/mode", async (req, res) => {
   try {

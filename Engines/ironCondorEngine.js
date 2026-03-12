@@ -329,8 +329,14 @@ const cacheAndSubscribe = (kiteSymbol, instrumentToken) => {
 const placeAndConfirm = async (tradingsymbol, transactionType, quantity, index) => {
   if (!LIVE()) {
     const id = `PAPER-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    console.log(`📝 [PAPER] ${transactionType} ${quantity} × ${tradingsymbol}`);
-    return { orderId: id, avgPrice: 0 };
+    // Use live WebSocket LTP as simulated fill price — realistic paper trading
+    // getLtp() reads from condorPrices{} which is fed by Kite WebSocket
+    // Symbol must already be subscribed via cacheAndSubscribe before this call
+    const avgPrice = getLtp(tradingsymbol) || 0;
+    console.log(`📝 [PAPER] ${transactionType} ${quantity} × ${tradingsymbol} @ ${avgPrice}`);
+    // Simulate 200ms delay — mirrors real Kite confirm latency in paper mode
+    await new Promise(r => setTimeout(r, 200));
+    return { orderId: id, avgPrice };
   }
 
   const kc    = getKiteInstance();
@@ -1401,6 +1407,9 @@ export const reconcileKitePositions = async () => {
     }
 
     // ── Job 2: no active trade — check for manual positions in Kite ───────
+    // Skip in paper mode — no real positions exist in Kite
+    if (!LIVE()) return;
+
     // Only run during market hours to avoid ghost detection
     const now  = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
     const mins = now.getHours() * 60 + now.getMinutes();

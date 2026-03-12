@@ -13,14 +13,14 @@ import { setIO as setSocketIO }  from "./config/socket.js";
 import { getKiteInstance }       from "./config/kiteConfig.js";
 
 // ─── Models ───────────────────────────────────────────────────────────────────
-import getActiveTradeModel from "./models/ironCondorActiveTradeModel.js";
+import getActiveTradeModel from "./models/activeTradeModel.js";
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 import tradeRoutes     from "./routes/ironCondorTradeRoutes.js";
-import autoCondorRoutes from "./routes/autoCondorRoutes.js";
+import autoCondorRoutes from "./routes/autoCondorTradeRoutes.js";
 import optionsRoutes   from "./routes/optionChainRoutes.js";
-import positionRoutes  from "./routes/ironCondorPositionRoutes.js";
-import condorRoutes    from "./routes/condorDashboardRoutes.js";
+import positionRoutes  from "./routes/positionRoutes.js";
+import condorRoutes    from "./routes/dashboardRoutes.js";
 
 // ─── Services ─────────────────────────────────────────────────────────────────
 import { sendTelegramAlert } from "./services/telegramService.js";

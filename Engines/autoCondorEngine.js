@@ -4,7 +4,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import "dotenv/config";
-import getActiveTradeModel              from "../models/ironCondorActiveTradeModel.js";
+import getActiveTradeModel              from "../models/activeTradeModel.js";
 import { sendCondorAlert }              from "../services/telegramService.js";
 import { kiteSymbolToToken }           from "../services/kiteSymbolMapper.js";
 import {

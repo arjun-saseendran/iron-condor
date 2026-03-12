@@ -3,8 +3,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import express from "express";
-import getActiveTradeModel from "../models/ironCondorActiveTradeModel.js";
-import { getCondorTradePerformanceModel } from "../models/condorTradePerformanceModel.js";
+import getActiveTradeModel from "../models/activeTradeModel.js";
+import { getCondorTradePerformanceModel } from "../models/tradePerformanceModel.js";
 import { condorPrices, getKitePnL } from "../Engines/ironCondorEngine.js";
 import { kiteSymbolToToken } from "../services/kiteSymbolMapper.js";
 

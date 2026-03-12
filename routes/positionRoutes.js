@@ -1,5 +1,5 @@
 import express from 'express';
-import { fetchAndCategorizePositions } from '../services/ironCondorPositionService.js';
+import { fetchAndCategorizePositions } from '../services/positionService.js';
 
 const router = express.Router();
 

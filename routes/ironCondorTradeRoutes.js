@@ -1,5 +1,5 @@
 import express from "express";
-import getActiveTradeModel from "../models/ironCondorActiveTradeModel.js";
+import getActiveTradeModel from "../models/activeTradeModel.js";
 import { enterIronCondor, exitAllLegs, fetchFullOptionChain, getSpotPrice, getNearestExpiry, selectCondorStrikes } from "../Engines/ironCondorEngine.js";
 
 const router = express.Router();

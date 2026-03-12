@@ -34,8 +34,8 @@ import { sendCondorAlert }               from "../services/telegramService.js";
 import { buildKiteSymbol, getKiteExchange } from "../services/kiteSymbolBuilder.js";
 import { cacheSymbol, kiteSymbolToToken }  from "../services/kiteSymbolMapper.js";
 import { subscribeCondorToken, onPriceUpdate, isFeedStale, getLastTickAge } from "../services/kiteLiveData.js";
-import getActiveTradeModel               from "../models/ironCondorActiveTradeModel.js";
-import { getCondorTradePerformanceModel } from "../models/condorTradePerformanceModel.js";
+import getActiveTradeModel               from "../models/activeTradeModel.js";
+import { getCondorTradePerformanceModel } from "../models/tradePerformanceModel.js";
 
 // ─── Live price store ─────────────────────────────────────────────────────────
 export const condorPrices = {};

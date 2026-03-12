@@ -92,14 +92,30 @@ app.get("/status", (_req, res) => res.json({ status: "Online", strategy: "Iron C
 // Open positions must be handled manually in Kite after stopping.
 app.post("/api/engine/stop", async (_req, res) => {
   try {
-    await sendTelegramAlert("🔴 <b>Iron Condor Engine STOPPED</b>\nKill switch triggered from dashboard.\n⚠️ Check Kite positions manually.");
-    res.json({ success: true, message: "Engine stopping..." });
-    // Stop after response is sent so client gets the reply
+    // Reply immediately so dashboard gets response before process dies
+    res.json({ success: true, message: "Exiting positions then stopping engine..." });
+
+    // Exit all open positions first
+    try {
+      const ActiveTrade = getActiveTradeModel();
+      const trade = await ActiveTrade.findOne({ status: { $ne: "COMPLETED" } });
+      if (trade) {
+        const { exitAllLegs } = await import("./Engines/ironCondorEngine.js");
+        await exitAllLegs(trade, "MANUAL_STOP");
+        console.log("✅ All legs exited before engine stop");
+      }
+    } catch (e) {
+      console.error("❌ Exit legs failed on stop:", e.message);
+      await sendTelegramAlert(`⚠️ <b>Exit before stop FAILED</b>\n${e.message}\n⚠️ Check Kite positions manually`);
+    }
+
+    await sendTelegramAlert("🔴 <b>Iron Condor Engine STOPPED</b>\nKill switch triggered from dashboard. All positions exited.");
+
     setTimeout(() => {
       exec("pm2 stop iron-condor", (err) => {
         if (err) console.error("❌ pm2 stop failed:", err.message);
       });
-    }, 500);
+    }, 1000);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

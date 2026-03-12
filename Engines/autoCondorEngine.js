@@ -67,7 +67,7 @@ export const armAutoCondor = () => {
     process.env.NIFTY_AUTO  === "true" ? "NIFTY"  : null,
     process.env.SENSEX_AUTO === "true" ? "SENSEX" : null,
   ].filter(Boolean).join(", ") || "none";
-  sendCondorAlert(`✅ <b>Auto Condor ARMED</b>\nIndex: ${enabledIndices}\nWaiting for entry day &amp; market open (09:30 IST).`).catch(() => {});
+  sendCondorAlert(`✅ <b>Auto Condor ARMED</b>\nIndex: ${enabledIndices}\nWaiting for entry day &amp; market open (09:20 IST).`).catch(() => {});
 };
 
 export const getAutoCondorState = () => ({ ..._state });
@@ -84,7 +84,7 @@ const getIST = () => {
   };
 };
 
-const inEntryWindow     = (h, m) => h === 9 && m >= 30 && m <= 45; // ✅ Entry only 09:30–09:45 IST
+const inEntryWindow     = (h, m) => h === 9 && m >= 20 && m <= 45; // ✅ Entry only 09:20–09:45 IST
 const inGapOpenWindow   = (h, m) => h === 9 && m >= 15 && m <= 25;
 // Gap open window has fully passed (after 9:25)
 const pastGapOpenWindow = (h, m) => h > 9 || (h === 9 && m > 25);
@@ -240,7 +240,7 @@ export const autoEnterIfNeeded = async () => {
   if (_state.entryDone) return;
 
   const { day, hours, minutes, date } = getIST();
-  if (!inEntryWindow(hours, minutes)) return; // ✅ Entry only 09:30–09:45 IST
+  if (!inEntryWindow(hours, minutes)) return; // ✅ Entry only 09:20–09:45 IST
 
   const ActiveTrade = getActiveTradeModel();
   const existing = await ActiveTrade.findOne({ status: { $in: ["ACTIVE", "EXITING"] } });

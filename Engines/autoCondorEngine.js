@@ -121,11 +121,10 @@ const checkGapOpen = async (trade) => {
     : parseInt(process.env.NIFTY_SPREAD_DISTANCE  || "150");
 
   const buffer         = trade.bufferPremium || 0;
-  // ✅ FIX: buffer INCREASES your protection — it was booked profit from firefight.
-  // Adding it to max loss means you can tolerate more loss before holding.
-  // Wrong was: spread - totalEntryPremium - buffer
-  // Correct is: spread - totalEntryPremium + buffer
-  const maxLossPerUnit = spread - trade.totalEntryPremium + buffer;
+  // Max loss = SPREAD_DISTANCE − (totalEntryPremium + bufferPremium)
+  // Spread width is absolute worst case. Collected premium + buffer already reduces that.
+  // The more you collected (including booked firefight profit), the less your max loss.
+  const maxLossPerUnit = spread - (trade.totalEntryPremium + buffer);
 
   const callSellKey = kiteSymbolToToken(trade.symbols.callSell);
   const callBuyKey  = kiteSymbolToToken(trade.symbols.callBuy);
@@ -135,12 +134,9 @@ const checkGapOpen = async (trade) => {
   const callNet = Math.max(0, (condorPrices[callSellKey] || 0) - (condorPrices[callBuyKey] || 0));
   const putNet  = Math.max(0, (condorPrices[putSellKey]  || 0) - (condorPrices[putBuyKey]  || 0));
 
-  // ✅ FIX: gap open loss calculation was wrong.
   // currentLossPerUnit = how much MORE the spreads cost now vs what we collected
   // = (callNet + putNet) - totalEntryPremium
-  // If positive → we are losing. If negative → we are still in profit.
-  // maxLossPerUnit = spread - totalEntryPremium - buffer (theoretical max)
-  // Compare: if currentLoss >= maxLoss → hold (can't get worse than spread width)
+  // Positive → losing. Negative → still in profit.
   const currentLossPerUnit = (callNet + putNet) - trade.totalEntryPremium;
   const currentLossRs      = currentLossPerUnit * trade.quantity;
   const maxLossRs          = maxLossPerUnit * trade.quantity;

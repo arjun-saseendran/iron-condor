@@ -21,9 +21,9 @@
 //   Butterfly SL = totalEntryPremium×3 + buffer
 //   Firefight applies once to butterfly, then exit all
 //
-// Gap open: maxLoss = spread − totalEntryPremium + buffer
-//   currentLoss < maxLoss  → exit
-//   currentLoss ≥ maxLoss  → hold till expiry, do NOT exit
+// Gap open / max loss: maxLoss per spread = spreadWidth − entryPremium
+//   currentLoss < maxLoss  → exit normally via Kite orders
+//   currentLoss ≥ maxLoss  → skip exit orders, hold to expiry (loss already capped by contract)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import "dotenv/config";
@@ -159,6 +159,14 @@ const slLevel              = (entry, buffer) => entry * SL_MULT()       + buffer
 const firefightLossLevel   = (entry)         => entry * FF_LOSS_MULT();
 const firefightProfitLevel = (entry)         => entry * FF_PROFIT_THR();
 const butterflySLLevel     = (losingEntry, newEntry, buffer) => (losingEntry * BF_SL_MULT()) + newEntry + buffer;
+
+// Max possible loss on the iron condor position:
+// = SPREAD_DISTANCE − (totalEntryPremium + bufferPremium)
+// Spread width is the absolute worst case. Collected premium + buffer reduces that.
+// Once current total loss reaches this number, no further loss is possible —
+// holding to expiry costs the same as exiting. No point placing exit orders.
+const maxPositionLoss = (trade) =>
+  Math.max(0, SPREAD[trade.index]() - ((trade.totalEntryPremium || 0) + (trade.bufferPremium || 0)));
 
 // ─── Option chain ─────────────────────────────────────────────────────────────
 export const fetchFullOptionChain = async (index, expiry) => {
@@ -676,8 +684,35 @@ export const exitAllLegs = async (trade, reason) => {
   const qty = trade.quantity;
   const idx = trade.index;
 
-  try { await exitSpread(callSell, callBuy, qty, idx); } catch (e) { console.error("❌ exit call:", e.message); }
-  try { await exitSpread(putSell,  putBuy,  qty, idx); } catch (e) { console.error("❌ exit put:",  e.message); }
+  // ── Max-loss check — full position before placing any exit orders ────────
+  // Max loss = SPREAD_DISTANCE − (totalEntryPremium + bufferPremium)
+  // If total current loss across both spreads already equals this,
+  // holding to expiry costs the same — skip all exit orders.
+  const callEntry    = trade.callSpreadEntryPremium || 0;
+  const putEntry     = trade.putSpreadEntryPremium  || 0;
+  const callNet      = getCallNet(trade);
+  const putNet       = getPutNet(trade);
+  const totalLoss    = Math.max(0, (callNet - callEntry) + (putNet - putEntry));
+  const maxLoss      = maxPositionLoss(trade);
+  const posAtMaxLoss = maxLoss > 0 && totalLoss >= maxLoss;
+
+  if (posAtMaxLoss) {
+    condorLog(`⚠️ Position at max loss (${totalLoss.toFixed(2)} ≥ ${maxLoss.toFixed(2)}) — skipping all exit orders, hold to expiry`, "warn");
+    await sendCondorAlert(
+      `⚠️ <b>Max Loss — Hold to Expiry</b> · ${trade.index}
+` +
+      `Total loss: <b>${totalLoss.toFixed(2)}</b> ≥ max: <b>${maxLoss.toFixed(2)}</b>
+` +
+      `No exit orders placed — contracts cap further loss.`
+    );
+  }
+
+  if (!posAtMaxLoss && callSell) {
+    try { await exitSpread(callSell, callBuy, qty, idx); } catch (e) { console.error("❌ exit call:", e.message); }
+  }
+  if (!posAtMaxLoss && putSell) {
+    try { await exitSpread(putSell, putBuy, qty, idx); } catch (e) { console.error("❌ exit put:", e.message); }
+  }
 
   const kitePnl = getKitePnL(trade);
   const pnl = kitePnl !== null
@@ -811,6 +846,44 @@ export const executeSLReset = async (trade, losingSide) => {
   // Exit losing spread — get actual fill prices for real loss calculation
   const losingSellSym = losingSide === "call" ? trade.symbols.callSell : trade.symbols.putSell;
   const losingBuySym  = losingSide === "call" ? trade.symbols.callBuy  : trade.symbols.putBuy;
+
+  // ── Gap-open / max-loss check ─────────────────────────────────────────────
+  // Max loss = SPREAD_DISTANCE − (totalEntryPremium + bufferPremium)
+  // This is the worst case net loss — already reduced by what we collected.
+  // If total current loss across both spreads already equals this, no further
+  // loss is possible. Exiting now only adds brokerage + slippage for zero benefit.
+  // Hold till expiry — the contracts themselves cap any further damage.
+  const callNet2       = getCallNet(trade);
+  const putNet2        = getPutNet(trade);
+  const totalLoss      = Math.max(0,
+    (callNet2 - (trade.callSpreadEntryPremium || 0)) +
+    (putNet2  - (trade.putSpreadEntryPremium  || 0))
+  );
+  const maxLoss        = maxPositionLoss(trade);
+  if (maxLoss > 0 && totalLoss >= maxLoss) {
+    condorLog(`⚠️ MAX LOSS REACHED | totalLoss=${totalLoss.toFixed(2)} maxLoss=${maxLoss.toFixed(2)} — holding to expiry, no exit orders`, "warn");
+    await sendCondorAlert(
+      `⚠️ <b>Max Loss — Hold to Expiry</b> · ${trade.index}
+` +
+      `Total loss: <b>${totalLoss.toFixed(2)}</b> ≥ max: <b>${maxLoss.toFixed(2)}</b>
+` +
+      `(Spread: ${SPREAD[trade.index]()} − collected: ${((trade.totalEntryPremium||0) + (trade.bufferPremium||0)).toFixed(2)})
+` +
+      `No exit orders placed — contracts cap further loss. Holding to expiry.`
+    );
+    const CondorPerf    = getCondorTradePerformanceModel();
+    const estimatedLoss = -(maxLoss * trade.quantity);
+    await ActiveTrade.updateOne({ _id: trade._id }, { status: "COMPLETED" });
+    await CondorPerf.create({
+      activeTradeId: trade._id,
+      index:         trade.index,
+      realizedPnL:   estimatedLoss,
+      exitReason:    "MAX_LOSS_HOLD_EXPIRY",
+    });
+    _slResetInProgress = false;
+    return;
+  }
+  // ─────────────────────────────────────────────────────────────────────────
 
   let slExitResult = { buyBackAvg: 0, sellCloseAvg: 0 };
   try {

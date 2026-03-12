@@ -792,27 +792,29 @@ export const executeSLReset = async (trade, losingSide) => {
     return;
   }
 
-  // 1st SL — capture losing spread live price BEFORE exit (display only — not used in core logic)
-  // Uses top-level getLtp (already defined above) — no duplicate needed
-  const losingSellSym = losingSide === "call" ? trade.symbols.callSell : trade.symbols.putSell;
-  const losingBuySym  = losingSide === "call" ? trade.symbols.callBuy  : trade.symbols.putBuy;
-  const losingNet     = Math.max(0, getLtp(losingSellSym) - getLtp(losingBuySym));
-  const losingEntry   = losingSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
-  // Loss = how much above entry we're buying back (× qty) — positive number means loss
-  const slLossThisSide = Math.max(0, losingNet - losingEntry) * trade.quantity;
+  // 1st SL — exit losing spread, get actual fill prices from Kite
+  const losingEntry    = losingSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
   const prevBookedLoss = trade.slBookedLoss || 0;
 
-  // Exit losing spread
+  // Exit losing spread — get actual fill prices for real loss calculation
+  const losingSellSym = losingSide === "call" ? trade.symbols.callSell : trade.symbols.putSell;
+  const losingBuySym  = losingSide === "call" ? trade.symbols.callBuy  : trade.symbols.putBuy;
+
+  let slExitResult = { buyBackAvg: 0, sellCloseAvg: 0 };
   try {
-    if (losingSide === "call") {
-      await exitSpread(trade.symbols.callSell, trade.symbols.callBuy, trade.quantity, trade.index);
-    } else {
-      await exitSpread(trade.symbols.putSell, trade.symbols.putBuy, trade.quantity, trade.index);
-    }
+    slExitResult = await exitSpreadWithFill(losingSellSym, losingBuySym, trade.quantity, trade.index);
   } catch (e) {
     console.error(`❌ SL exit error ${losingSide}:`, e.message);
+    await sendCondorAlert(`🚨 <b>SL EXIT FAILED</b> · ${trade.index}
+${losingSide} spread exit failed: ${e.message}
+⚠️ Check Kite positions manually`);
   }
 
+  // Actual loss from real fill prices
+  const exitNetCost    = Math.max(0, slExitResult.buyBackAvg - slExitResult.sellCloseAvg);
+  const slLossThisSide = Math.max(0, exitNetCost - losingEntry) * trade.quantity;
+
+  // Enter fresh replacement spread — actual fill price from Kite
   const spot        = await getSpotPrice(trade.index);
   const strikes     = await fetchFullOptionChain(trade.index, trade.expiry);
   const replacement = findReplacementSpread(strikes, spot, trade.index, losingSide);
@@ -830,38 +832,38 @@ export const executeSLReset = async (trade, losingSide) => {
   }
 
   const newOrders = await enterSpread(newSellSym, newBuySym, trade.quantity, trade.index);
+  const newEntry  = newOrders.actualNet; // actual fill from Kite — not LTP
 
   const upd = {
     slCount:             newSlCount,
     bufferPremium:       0,
-    postSlFirefightDone: false, // ✅ NEW: reset so engine watches for single-side FF after this SL
-    slBookedLoss:        prevBookedLoss + slLossThisSide, // ✅ NEW: accumulate SL loss (display only)
-    // ✅ FIX: same totalEntryPremium ternary bug fixed here too
+    postSlFirefightDone: false,
+    slBookedLoss:        prevBookedLoss + slLossThisSide,
     totalEntryPremium:
-      (losingSide === "call" ? replacement.net              : trade.callSpreadEntryPremium) +
-      (losingSide === "put"  ? replacement.net              : trade.putSpreadEntryPremium),
+      (losingSide === "call" ? newEntry : trade.callSpreadEntryPremium) +
+      (losingSide === "put"  ? newEntry : trade.putSpreadEntryPremium),
   };
   if (losingSide === "call") {
     upd["symbols.callSell"]       = newSellSym;
     upd["symbols.callBuy"]        = newBuySym;
     upd["orderIds.callSell"]      = newOrders.sellId;
     upd["orderIds.callBuy"]       = newOrders.buyId;
-    upd["callSpreadEntryPremium"] = replacement.net;
+    upd["callSpreadEntryPremium"] = newEntry;
   } else {
     upd["symbols.putSell"]        = newSellSym;
     upd["symbols.putBuy"]         = newBuySym;
     upd["orderIds.putSell"]       = newOrders.sellId;
     upd["orderIds.putBuy"]        = newOrders.buyId;
-    upd["putSpreadEntryPremium"]  = replacement.net;
+    upd["putSpreadEntryPremium"]  = newEntry;
   }
   await ActiveTrade.updateOne({ _id: trade._id }, { $set: upd });
 
   await sendCondorAlert(
     `🔄 <b>SL Reset</b> · ${trade.index} · ${losingSide}\n` +
-    `New: SELL ${newSellSym} / BUY ${newBuySym} · Net: <b>${replacement.net.toFixed(2)}</b>\n` +
+    `New: SELL ${newSellSym} / BUY ${newBuySym} · Net: <b>${newEntry.toFixed(2)}</b>\n` +
     `slCount: <b>${newSlCount}</b> · Buffer: reset to 0`
   );
-  condorLog(`🔄 SL RESET ${trade.index} | ${losingSide} | new: ${newSellSym}/${newBuySym} net=${replacement.net.toFixed(2)} | slCount=${newSlCount}`, "warn");
+  condorLog(`🔄 SL RESET ${trade.index} | ${losingSide} | new: ${newSellSym}/${newBuySym} net=${newEntry.toFixed(2)} | slCount=${newSlCount}`, "warn");
   _slResetInProgress = false; // 🔓 Release guard
 };
 
@@ -880,17 +882,15 @@ export const convertToButterfly = async (trade, losingSide) => {
   console.log(`🦋 Converting to Butterfly — ${trade.index} | exit ${profitSide} side, keep ${losingSide} side`);
   condorLog(`🦋 BUTTERFLY conversion started — ${trade.index} | exiting profit side (${profitSide})`, "warn");
 
-  // 1. Exit profit side only — book the profit
-  const profitNet = profitSide === "call" ? getCallNet(trade) : getPutNet(trade);
-  const profitEntry = profitSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
-  const profitBooked = Math.max(0, profitEntry - profitNet);
-  const newBuffer    = (trade.bufferPremium || 0) + profitBooked;
+  // 1. Exit profit side — actual fill prices from Kite for real buffer calculation
+  const profitEntry   = profitSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
+  const profitSellSym = profitSide === "call" ? trade.symbols.callSell : trade.symbols.putSell;
+  const profitBuySym  = profitSide === "call" ? trade.symbols.callBuy  : trade.symbols.putBuy;
 
-  if (profitSide === "call") {
-    await exitSpread(trade.symbols.callSell, trade.symbols.callBuy, trade.quantity, trade.index);
-  } else {
-    await exitSpread(trade.symbols.putSell, trade.symbols.putBuy, trade.quantity, trade.index);
-  }
+  const exitResult   = await exitSpreadWithFill(profitSellSym, profitBuySym, trade.quantity, trade.index);
+  const exitNetCost  = Math.max(0, exitResult.buyBackAvg - exitResult.sellCloseAvg);
+  const profitBooked = Math.max(0, profitEntry - exitNetCost);
+  const newBuffer    = (trade.bufferPremium || 0) + profitBooked;
 
   // 2. Find ATM strike — must match the losing side's sell leg strike
   const spot    = await getSpotPrice(trade.index);
@@ -911,12 +911,8 @@ export const convertToButterfly = async (trade, losingSide) => {
     cacheAndSubscribe(newBuySym,  sel.putBuy.putKey);
   }
 
-  const newOrders  = await enterSpread(newSellSym, newBuySym, trade.quantity, trade.index);
-  const newEntry   = Math.max(0,
-    profitSide === "call"
-      ? (sel.callSell.callLtp - sel.callBuy.callLtp)
-      : (sel.callSell.callLtp - sel.putBuy.putLtp)
-  );
+  const newOrders = await enterSpread(newSellSym, newBuySym, trade.quantity, trade.index);
+  const newEntry  = newOrders.actualNet; // actual fill from Kite — not LTP
 
   // 4. Update DB — keep losing side symbols unchanged, update profit side to new ATM spread
   const losingEntry = losingSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
@@ -1109,35 +1105,24 @@ const _checkConditions = async (trade) => {
 };
 
 // ─── SCAN & SYNC — every 5 seconds ───────────────────────────────────────────
+// ─── scanAndSyncOrders ────────────────────────────────────────────────────────
+// Runs every 1 second — uses live WebSocket prices (condorPrices{}) only.
+// No REST calls here — dashboard gets real-time data from Kite WebSocket feed.
 export const scanAndSyncOrders = async () => {
   const ActiveTrade = getActiveTradeModel();
   const trade = await ActiveTrade.findOne({ status: "ACTIVE" });
   if (!trade) return;
-
-  // Fetch Kite positions + orders
-  try {
-    const kc = getKiteInstance();
-    const [pos, orders] = await Promise.all([
-      kc.getPositions(),
-      kc.getOrders(),
-    ]);
-    updateKitePositions(pos?.net || []);
-    updateKiteOrders(orders || []);
-  } catch (e) {
-    console.error("❌ Kite fetch error:", e.message);
-  }
 
   const callNet    = getCallNet(trade);
   const putNet     = getPutNet(trade);
   const buffer     = trade.bufferPremium || 0;
   const callEntry  = trade.callSpreadEntryPremium;
   const putEntry   = trade.putSpreadEntryPremium;
-  const totalEntry = trade.totalEntryPremium;
 
-  const kitePnl = getKitePnL(trade);
-  const livePnL = kitePnl !== null
-    ? kitePnl
-    : ((callEntry - callNet) + (putEntry - putNet)) * trade.quantity;
+  // P&L from live WebSocket prices — no REST needed
+  const livePnL = ((callEntry - callNet) + (putEntry - putNet)) * trade.quantity;
+  const kitePnl = getKitePnL(trade); // uses cached REST data updated by reconcileKitePositions
+  const pnl     = kitePnl !== null ? kitePnl : livePnL;
 
   const io = getIO();
   if (io) {
@@ -1146,7 +1131,7 @@ export const scanAndSyncOrders = async () => {
       mode:             trade.mode,
       isButterfly:      trade.isIronButterfly,
       slCount:          trade.slCount,
-      pnl:              livePnL.toFixed(2),
+      pnl:              pnl.toFixed(2),
       pnlSource:        kitePnl !== null ? "kite" : "live",
       buffer:           buffer.toFixed(2),
       expiry:           trade.expiry,
@@ -1175,13 +1160,10 @@ export const scanAndSyncOrders = async () => {
     });
   }
 
-  // Re-check conditions (catches ticks missed while Kite fetch was running)
-  // ✅ STALE FEED GUARD: refuse SL checks if Kite feed has been dark for 30s+
+  // SL/FF condition checks — stale feed guard
   if (isFeedStale()) {
     if (!_staleAlertSent) {
       _staleAlertSent = true;
-      // ✅ FIX: only alert if active trade exists — no spam after market hours
-      const ActiveTrade = getActiveTradeModel();
       const hasTrade = await ActiveTrade.findOne({ status: "ACTIVE" }).lean().catch(() => null);
       if (hasTrade) {
         const age = getLastTickAge();
@@ -1200,5 +1182,27 @@ export const scanAndSyncOrders = async () => {
     try { await _checkConditions(trade); }
     catch (e) { console.error("❌ scanAndSync condition check:", e.message); }
     finally { _actionInProgress = false; }
+  }
+};
+
+// ─── reconcileKitePositions ───────────────────────────────────────────────────
+// Runs every 60 seconds — fetches Kite REST positions + orders for reconciliation.
+// Keeps cached P&L data fresh without hammering the REST API every second.
+export const reconcileKitePositions = async () => {
+  const ActiveTrade = getActiveTradeModel();
+  const trade = await ActiveTrade.findOne({ status: "ACTIVE" });
+  if (!trade) return;
+
+  try {
+    const kc = getKiteInstance();
+    const [pos, orders] = await Promise.all([
+      kc.getPositions(),
+      kc.getOrders(),
+    ]);
+    updateKitePositions(pos?.net || []);
+    updateKiteOrders(orders || []);
+    console.log("🔄 Kite positions reconciled");
+  } catch (e) {
+    console.error("❌ Kite reconcile error:", e.message);
   }
 };

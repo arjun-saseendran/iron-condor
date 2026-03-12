@@ -4,6 +4,7 @@ import http    from "http";
 import { Server } from "socket.io";
 import cors   from "cors";
 import cron   from "node-cron";
+import { exec } from "child_process";
 
 // ─── Config & DB ──────────────────────────────────────────────────────────────
 import { connectDatabases }  from "./config/db.js";
@@ -85,6 +86,25 @@ app.get("/api/history", async (req, res) => {
 
 app.get("/status", (_req, res) => res.json({ status: "Online", strategy: "Iron Condor", timestamp: new Date() }));
 
+// ─── Engine Stop (Kill Switch) ────────────────────────────────────────────────
+// Stops the pm2 process immediately — does NOT touch open positions.
+// Use from dashboard when you need to kill the bot safely.
+// Open positions must be handled manually in Kite after stopping.
+app.post("/api/engine/stop", async (_req, res) => {
+  try {
+    await sendTelegramAlert("🔴 <b>Iron Condor Engine STOPPED</b>\nKill switch triggered from dashboard.\n⚠️ Check Kite positions manually.");
+    res.json({ success: true, message: "Engine stopping..." });
+    // Stop after response is sent so client gets the reply
+    setTimeout(() => {
+      exec("pm2 stop iron-condor", (err) => {
+        if (err) console.error("❌ pm2 stop failed:", err.message);
+      });
+    }, 500);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Mode switch ─────────────────────────────────────────────────────────────
 app.post("/api/trades/mode", async (req, res) => {
   try {
@@ -165,7 +185,7 @@ const start = async () => {
     initKiteLiveData();
     console.log("✅ Kite WebSocket ticker started");
 
-    // ── Fast loop every 1 second — monitor + entry checks ───────────────────
+    // ── Fast loop every 1 second — monitor + entry checks + live socket emit ──
     setInterval(async () => {
       try {
         await autoMonitorTick();
@@ -182,22 +202,25 @@ const start = async () => {
               if (tok) subscribeCondorToken(tok);
             });
         }
+
+        // Emit live dashboard data every tick using WebSocket prices — no REST call
+        await scanAndSyncOrders();
       } catch (err) {
         console.error("❌ Main loop error:", err.message);
       }
     }, 1000);
 
-    // ── Slow loop every 5 seconds — Kite position/order sync ─────────────────
-    // ✅ FIX: scanAndSyncOrders fetches Kite REST API (positions + orders).
-    //         Running it every 1s = 60 REST calls/min — unnecessary and rate-limit risky.
-    //         5s is sufficient for P&L display and SL cross-check.
+    // ── Reconciliation loop every 60 seconds — Kite REST positions/orders sync ─
+    // Live prices come from WebSocket (condorPrices{}) — no need to poll REST for P&L.
+    // REST reconciliation runs once per minute only — for position cross-check.
     setInterval(async () => {
       try {
-        await scanAndSyncOrders();
+        const { reconcileKitePositions } = await import("./Engines/ironCondorEngine.js");
+        await reconcileKitePositions();
       } catch (err) {
-        console.error("❌ Scan loop error:", err.message);
+        console.error("❌ Reconcile loop error:", err.message);
       }
-    }, 5000);
+    }, 60_000);
   });
 };
 

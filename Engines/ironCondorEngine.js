@@ -361,17 +361,16 @@ const placeAndConfirm = async (tradingsymbol, transactionType, quantity, index) 
   const orderId = order.order_id;
   console.log(`⏳ Kite: ${transactionType} ${tradingsymbol} → waiting confirm (${orderId})`);
 
-  // Poll Kite until COMPLETE or REJECTED — max 10 attempts × 500ms = 5s
-  // ✅ FIX: getOrders() call wrapped in try/catch — transient network errors
-  // (rate limit, API hiccup) now log a warning and retry instead of crashing
-  // the entire confirmation loop. Only a confirmed REJECTED status throws hard.
+  // ── Phase 1: Fast polling — 10 attempts × 500ms = 5s ──────────────────────
+  // Covers normal fills. Transient API errors warn and retry (do not abort).
+  // Only a confirmed REJECTED status throws hard.
   for (let i = 0; i < 10; i++) {
     await new Promise(r => setTimeout(r, 500));
     try {
       const orders = await kc.getOrders();
       const found  = orders.find(o => o.order_id === orderId);
       if (!found) {
-        console.log(`⏳ Kite: ${orderId} not found yet — polling (attempt ${i + 1}/10)`);
+        console.log(`⏳ Kite: ${orderId} not in order book yet — attempt ${i + 1}/10`);
         continue;
       }
       if (found.status === "COMPLETE") {
@@ -380,19 +379,61 @@ const placeAndConfirm = async (tradingsymbol, transactionType, quantity, index) 
         return { orderId, avgPrice };
       }
       if (found.status === "REJECTED") {
-        // ✅ Confirmed broker rejection — hard stop, no retry
+        // Confirmed broker rejection — hard stop, no retry
         throw new Error(`REJECTED: ${tradingsymbol} — ${found.status_message || "no reason"}`);
       }
-      // OPEN / PENDING / TRIGGER PENDING — keep waiting
-      console.log(`⏳ Kite: ${orderId} status=${found.status} — polling (attempt ${i + 1}/10)`);
+      // OPEN / PENDING / TRIGGER PENDING — keep polling
+      console.log(`⏳ Kite: ${orderId} status=${found.status} — attempt ${i + 1}/10`);
     } catch (err) {
-      // ✅ Only re-throw confirmed Kite rejections (our own throw above).
-      // Transient getOrders() failures (network, rate limit) log and retry.
-      if (err.message.startsWith("REJECTED:")) throw err;
+      if (err.message.startsWith("REJECTED:")) throw err; // hard stop
       console.warn(`⚠️ Kite getOrders error on attempt ${i + 1}/10 — retrying: ${err.message}`);
     }
   }
-  throw new Error(`Timeout: ${tradingsymbol} did not confirm in 5s`);
+
+  // ── Phase 2: Background retry — poll every 2s indefinitely ──────────────────
+  // Order was placed on Kite but fill not confirmed in 5s (slow API / volatile open).
+  // We MUST keep polling — throwing here would abandon a potentially filled order.
+  // Callers are blocked waiting for this promise — no second order can fire.
+  console.warn(`⚠️ Kite: ${orderId} (${tradingsymbol}) not confirmed in 5s — entering background retry every 2s`);
+  await sendCondorAlert(
+    `⚠️ <b>Order confirm slow</b>\n` +
+    `${transactionType} ${tradingsymbol}\n` +
+    `Order ID: ${orderId}\n` +
+    `Not confirmed in 5s — polling Kite every 2s until definitive answer`
+  );
+
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      const orders = await kc.getOrders();
+      const found  = orders.find(o => o.order_id === orderId);
+      if (!found) {
+        console.warn(`⚠️ BG retry ${attempt}: ${orderId} still not in order book — waiting...`);
+        continue;
+      }
+      if (found.status === "COMPLETE") {
+        const avgPrice = found.average_price || 0;
+        console.log(`✅ BG retry ${attempt}: ${orderId} COMPLETE | avgPrice=${avgPrice}`);
+        await sendCondorAlert(
+          `✅ <b>Order confirmed (background)</b>\n` +
+          `${transactionType} ${tradingsymbol}\n` +
+          `Avg Price: ${avgPrice}\n` +
+          `Confirmed after ${attempt} background attempt(s)`
+        );
+        return { orderId, avgPrice };
+      }
+      if (found.status === "REJECTED") {
+        throw new Error(`REJECTED: ${tradingsymbol} — ${found.status_message || "no reason"}`);
+      }
+      // OPEN / PENDING — keep waiting
+      console.warn(`⚠️ BG retry ${attempt}: ${orderId} status=${found.status} — still waiting...`);
+    } catch (err) {
+      if (err.message.startsWith("REJECTED:")) throw err; // hard stop
+      console.warn(`⚠️ BG retry ${attempt}: getOrders error — retrying: ${err.message}`);
+    }
+  }
 };
 
 // ENTRY: BUY long leg first (confirmed), then SELL short leg (confirmed)
@@ -465,28 +506,37 @@ ${sellCloseErr.message}
 };
 
 // EXIT: close short (BUY back) first confirmed, then close long (SELL) confirmed
-// If any leg fails — alert on Telegram, do not retry
+// On broker rejection — wait 2s and retry once, then alert if still failing.
+// placeAndConfirm blocks until Kite answers definitively (no timeout).
 const exitSpread = async (sellSymbol, buySymbol, quantity, index) => {
   // 1. Buy back the short leg
   try {
     await placeAndConfirm(sellSymbol, "BUY", quantity, index);
   } catch (buyBackErr) {
-    condorLog(`🚨 Exit BUY-BACK failed (${sellSymbol}): ${buyBackErr.message} — attempting long leg close anyway`, "error");
-    await sendCondorAlert(`🚨 <b>EXIT WARNING</b>
-Buy-back failed: ${sellSymbol}
-${buyBackErr.message}
-⚠️ Check Kite positions manually`);
+    condorLog(`🚨 Exit BUY-BACK rejected (${sellSymbol}): ${buyBackErr.message} — retrying once`, "error");
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      await placeAndConfirm(sellSymbol, "BUY", quantity, index);
+      condorLog(`✅ BUY-BACK retry succeeded (${sellSymbol})`, "success");
+    } catch (retryErr) {
+      condorLog(`🚨 BUY-BACK retry also failed (${sellSymbol}): ${retryErr.message}`, "error");
+      await sendCondorAlert(`🚨 <b>EXIT WARNING</b>\nBuy-back failed after retry: ${sellSymbol}\n${retryErr.message}\n⚠️ Check Kite positions manually`);
+    }
   }
 
   // 2. Close the long leg
   try {
     await placeAndConfirm(buySymbol, "SELL", quantity, index);
   } catch (sellCloseErr) {
-    condorLog(`🚨 Exit SELL-CLOSE failed (${buySymbol}): ${sellCloseErr.message} — manual intervention required`, "error");
-    await sendCondorAlert(`🚨 <b>EXIT FAILURE</b>
-Sell-close failed: ${buySymbol}
-${sellCloseErr.message}
-⚠️ Manual intervention required in Kite`);
+    condorLog(`🚨 Exit SELL-CLOSE rejected (${buySymbol}): ${sellCloseErr.message} — retrying once`, "error");
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      await placeAndConfirm(buySymbol, "SELL", quantity, index);
+      condorLog(`✅ SELL-CLOSE retry succeeded (${buySymbol})`, "success");
+    } catch (retryErr) {
+      condorLog(`🚨 SELL-CLOSE retry also failed (${buySymbol}): ${retryErr.message}`, "error");
+      await sendCondorAlert(`🚨 <b>EXIT FAILURE</b>\nSell-close failed after retry: ${buySymbol}\n${retryErr.message}\n⚠️ Manual intervention required in Kite`);
+    }
   }
 };
 

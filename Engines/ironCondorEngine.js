@@ -362,20 +362,35 @@ const placeAndConfirm = async (tradingsymbol, transactionType, quantity, index) 
   console.log(`⏳ Kite: ${transactionType} ${tradingsymbol} → waiting confirm (${orderId})`);
 
   // Poll Kite until COMPLETE or REJECTED — max 10 attempts × 500ms = 5s
+  // ✅ FIX: getOrders() call wrapped in try/catch — transient network errors
+  // (rate limit, API hiccup) now log a warning and retry instead of crashing
+  // the entire confirmation loop. Only a confirmed REJECTED status throws hard.
   for (let i = 0; i < 10; i++) {
     await new Promise(r => setTimeout(r, 500));
-    const orders = await kc.getOrders();
-    const found  = orders.find(o => o.order_id === orderId);
-    if (!found) continue;
-    if (found.status === "COMPLETE") {
-      const avgPrice = found.average_price || 0;
-      console.log(`✅ Kite confirmed: ${transactionType} ${tradingsymbol} avgPrice=${avgPrice}`);
-      return { orderId, avgPrice };
+    try {
+      const orders = await kc.getOrders();
+      const found  = orders.find(o => o.order_id === orderId);
+      if (!found) {
+        console.log(`⏳ Kite: ${orderId} not found yet — polling (attempt ${i + 1}/10)`);
+        continue;
+      }
+      if (found.status === "COMPLETE") {
+        const avgPrice = found.average_price || 0;
+        console.log(`✅ Kite confirmed: ${transactionType} ${tradingsymbol} avgPrice=${avgPrice}`);
+        return { orderId, avgPrice };
+      }
+      if (found.status === "REJECTED") {
+        // ✅ Confirmed broker rejection — hard stop, no retry
+        throw new Error(`REJECTED: ${tradingsymbol} — ${found.status_message || "no reason"}`);
+      }
+      // OPEN / PENDING / TRIGGER PENDING — keep waiting
+      console.log(`⏳ Kite: ${orderId} status=${found.status} — polling (attempt ${i + 1}/10)`);
+    } catch (err) {
+      // ✅ Only re-throw confirmed Kite rejections (our own throw above).
+      // Transient getOrders() failures (network, rate limit) log and retry.
+      if (err.message.startsWith("REJECTED:")) throw err;
+      console.warn(`⚠️ Kite getOrders error on attempt ${i + 1}/10 — retrying: ${err.message}`);
     }
-    if (found.status === "REJECTED") {
-      throw new Error(`REJECTED: ${tradingsymbol} — ${found.status_message || "no reason"}`);
-    }
-    // OPEN / PENDING — keep waiting
   }
   throw new Error(`Timeout: ${tradingsymbol} did not confirm in 5s`);
 };

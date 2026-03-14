@@ -1,7 +1,6 @@
 import { KiteConnect } from 'kiteconnect';
 import dotenv from 'dotenv';
-import fs from 'fs';
-import path from 'path';
+import { Token } from '../models/tokenModel.js';
 
 dotenv.config();
 
@@ -12,51 +11,25 @@ const kc = new KiteConnect({
 
 let dailyAccessToken = null;
 
-// ✅ FIX: made async to match server.js which does `await loadTokenFromDisk()`.
-// A sync function wrapped in await is harmless but silently drops any future
-// async logic (e.g. fetching token from a secrets manager). Async is correct here.
-export const loadTokenFromDisk = async () => {
-  const token = process.env.KITE_ACCESS_TOKEN;
-  if (token) {
-    dailyAccessToken = token;
-    kc.setAccessToken(token);
-    console.log("✅ Kite access token loaded from .env");
-    return token;
+// ─── Load token from DB on startup ───────────────────────────────────────────
+export const loadTokenFromDB = async () => {
+  const saved = await Token.findOne({});
+  if (saved?.accessToken) {
+    dailyAccessToken = saved.accessToken;
+    kc.setAccessToken(saved.accessToken);
+    console.log("✅ Kite access token loaded from DB");
+    return saved.accessToken;
   }
-  console.warn("⚠️ KITE_ACCESS_TOKEN not found in .env");
+  console.warn("⚠️ No Kite token in DB — visit /api/auth/zerodha/login to authenticate");
   return null;
 };
 
+// ─── Set token in memory only (DB save handled in authControllers) ────────────
 export const setAccessToken = (token) => {
   dailyAccessToken = token;
   kc.setAccessToken(token);
-
-  const envPath = path.resolve(process.cwd(), ".env");
-  let envData   = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8") : "";
-
-  const key     = "KITE_ACCESS_TOKEN";
-  const regex   = new RegExp(`^${key}=.*`, "m");
-  const newLine = `${key}="${token}"`;
-
-  envData = regex.test(envData)
-    ? envData.replace(regex, newLine)
-    : envData + (envData.endsWith("\n") ? "" : "\n") + newLine + "\n";
-
-  fs.writeFileSync(envPath, envData, "utf8");
-  console.log("✅ Kite access token saved to .env");
+  console.log("✅ Kite access token set in memory");
 };
 
-export const getKiteInstance = () => {
-  // ✅ FIX: loadTokenFromDisk is async but was called without await here.
-  //         getKiteInstance must stay sync (used everywhere inline), so instead
-  //         we call the sync fallback directly — read token from env immediately.
-  //         loadTokenFromDisk() at startup already handles the proper async load.
-  if (!dailyAccessToken) {
-    const token = process.env.KITE_ACCESS_TOKEN;
-    if (token) {
-      dailyAccessToken = token;
-      kc.setAccessToken(token);
-    }
-  }
-  return kc;
-};
+// ─── Get Kite instance ────────────────────────────────────────────────────────
+export const getKiteInstance = () => kc;

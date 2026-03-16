@@ -1,7 +1,12 @@
 // ─── Kite Live Data (WebSocket Ticker) ───────────────────────────────────────
-// Connects to Kite WebSocket (KiteTicker) for real-time LTP.
-// Prices are stored in condorPrices{} (owned by ironCondorEngine) via callback.
-// This service is DATA ONLY — no orders are placed here.
+// Connects to Kite WebSocket (KiteTicker) for:
+//   1. Real-time LTP (binary ticks) → condorPrices via _priceCallback
+//   2. Order update push (text/JSON) → resolves waitForOrderConfirmation()
+//
+// KiteTicker delivers BOTH on a single WebSocket connection:
+//   - Market data = binary messages  → ticker.on("ticks", ...)
+//   - Order updates = text/JSON      → ticker.on("order_update", ...)
+// No separate socket needed for Kite.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import "dotenv/config";
@@ -30,6 +35,53 @@ export const getLastTickAge = () =>
 // Called as: _priceCallback(instrumentToken, ltp)
 let _priceCallback = null;
 export const onPriceUpdate = (fn) => { _priceCallback = fn; };
+
+// ─── Order confirmation via WebSocket push ────────────────────────────────────
+// Pending order confirmations: Map of orderId → { resolve, reject, timer }
+const _pendingOrders = new Map();
+
+// Called by ironCondorEngine's placeAndConfirm() instead of REST polling.
+// Resolves instantly when Kite pushes order_update with COMPLETE/REJECTED/CANCELLED.
+// Hard timeout of 30s → falls back to REST poll in ironCondorEngine.
+export const waitForOrderConfirmation = (orderId, timeoutMs = 30000) => {
+  return new Promise((resolve, reject) => {
+    const id = String(orderId);
+
+    const timer = setTimeout(() => {
+      _pendingOrders.delete(id);
+      reject(new Error(`Order ${id}: No confirmation from Kite order socket in ${timeoutMs / 1000}s`));
+    }, timeoutMs);
+
+    _pendingOrders.set(id, { resolve, reject, timer });
+  });
+};
+
+// ─── Internal: handle incoming order_update from Kite WebSocket ───────────────
+function _handleOrderUpdate(order) {
+  const id     = String(order?.order_id ?? "");
+  const status = order?.status; // "COMPLETE", "REJECTED", "CANCELLED", "OPEN", "UPDATE"...
+
+  if (!id || !_pendingOrders.has(id)) return;
+
+  // Only resolve/reject on terminal statuses — ignore UPDATE/OPEN/PENDING
+  if (status === "COMPLETE") {
+    const { resolve, timer } = _pendingOrders.get(id);
+    clearTimeout(timer);
+    _pendingOrders.delete(id);
+    const avgPrice = order?.average_price ?? 0;
+    console.log(`✅ [KiteTicker] Order ${id} COMPLETE | avgPrice=${avgPrice}`);
+    resolve({ orderId: id, avgPrice });
+
+  } else if (status === "REJECTED" || status === "CANCELLED") {
+    const { reject, timer } = _pendingOrders.get(id);
+    clearTimeout(timer);
+    _pendingOrders.delete(id);
+    const reason = order?.status_message || status;
+    console.error(`❌ [KiteTicker] Order ${id} ${status}: ${reason}`);
+    reject(new Error(`REJECTED: ${order?.tradingsymbol ?? id} — ${reason}`));
+  }
+  // All other statuses (OPEN, UPDATE, TRIGGER PENDING) → Kite will push again when final
+}
 
 // ─── Connect ──────────────────────────────────────────────────────────────────
 export const initKiteLiveData = () => {
@@ -72,6 +124,15 @@ const _connect = (apiKey, accessToken) => {
         _priceCallback(tick.instrument_token, ltp);
       }
     }
+  });
+
+  // ── Order update push — resolves waitForOrderConfirmation() instantly ──────
+  // Kite streams order updates as text/JSON on the same WebSocket connection.
+  // Terminal statuses: COMPLETE → resolve, REJECTED/CANCELLED → reject.
+  // Non-terminal (OPEN, UPDATE) → ignored, Kite will push again when final.
+  ticker.on("order_update", (order) => {
+    console.log(`📬 [KiteTicker] order_update: ${order?.order_id} status=${order?.status}`);
+    _handleOrderUpdate(order);
   });
 
   ticker.on("disconnect", (error) => {

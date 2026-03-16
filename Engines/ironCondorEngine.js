@@ -33,7 +33,7 @@ import { getIO }                         from "../config/socket.js";
 import { sendCondorAlert }               from "../services/telegramService.js";
 import { buildKiteSymbol, getKiteExchange } from "../services/kiteSymbolBuilder.js";
 import { cacheSymbol, kiteSymbolToToken }  from "../services/kiteSymbolMapper.js";
-import { subscribeCondorToken, onPriceUpdate, isFeedStale, getLastTickAge } from "../services/kiteLiveData.js";
+import { subscribeCondorToken, onPriceUpdate, isFeedStale, getLastTickAge, waitForOrderConfirmation } from "../services/kiteLiveData.js";
 import getActiveTradeModel               from "../models/activeTradeModel.js";
 import { getCondorTradePerformanceModel } from "../models/tradePerformanceModel.js";
 
@@ -337,103 +337,98 @@ const cacheAndSubscribe = (kiteSymbol, instrumentToken) => {
 const placeAndConfirm = async (tradingsymbol, transactionType, quantity, index) => {
   if (!LIVE()) {
     const id = `PAPER-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    // Use live WebSocket LTP as simulated fill price — realistic paper trading
-    // getLtp() reads from condorPrices{} which is fed by Kite WebSocket
-    // Symbol must already be subscribed via cacheAndSubscribe before this call
     const avgPrice = getLtp(tradingsymbol) || 0;
     console.log(`📝 [PAPER] ${transactionType} ${quantity} × ${tradingsymbol} @ ${avgPrice}`);
-    // Simulate 200ms delay — mirrors real Kite confirm latency in paper mode
     await new Promise(r => setTimeout(r, 200));
     return { orderId: id, avgPrice };
   }
 
   const kc    = getKiteInstance();
   const order = await kc.placeOrder("regular", {
-    exchange:         getKiteExchange(index),
+    exchange:          getKiteExchange(index),
     tradingsymbol,
-    transaction_type: transactionType,
+    transaction_type:  transactionType,
     quantity,
-    order_type:       "MARKET",
-    product:          "NRML",
+    order_type:        "MARKET",
+    product:           "NRML",
     market_protection: 1,
   });
 
-  const orderId = order.order_id;
+  const orderId = String(order.order_id);
   console.log(`⏳ Kite: ${transactionType} ${tradingsymbol} → waiting confirm (${orderId})`);
 
-  // ── Phase 1: Fast polling — 10 attempts × 500ms = 5s ──────────────────────
-  // Covers normal fills. Transient API errors warn and retry (do not abort).
-  // Only a confirmed REJECTED status throws hard.
-  for (let i = 0; i < 10; i++) {
-    await new Promise(r => setTimeout(r, 500));
-    try {
-      const orders = await kc.getOrders();
-      const found  = orders.find(o => o.order_id === orderId);
-      if (!found) {
-        console.log(`⏳ Kite: ${orderId} not in order book yet — attempt ${i + 1}/10`);
-        continue;
-      }
-      if (found.status === "COMPLETE") {
-        const avgPrice = found.average_price || 0;
-        console.log(`✅ Kite confirmed: ${transactionType} ${tradingsymbol} avgPrice=${avgPrice}`);
-        return { orderId, avgPrice };
-      }
-      if (found.status === "REJECTED") {
-        // Confirmed broker rejection — hard stop, no retry
-        throw new Error(`REJECTED: ${tradingsymbol} — ${found.status_message || "no reason"}`);
-      }
-      // OPEN / PENDING / TRIGGER PENDING — keep polling
-      console.log(`⏳ Kite: ${orderId} status=${found.status} — attempt ${i + 1}/10`);
-    } catch (err) {
-      if (err.message.startsWith("REJECTED:")) throw err; // hard stop
-      console.warn(`⚠️ Kite getOrders error on attempt ${i + 1}/10 — retrying: ${err.message}`);
-    }
+  // ── PRIMARY: KiteTicker order_update push ─────────────────────────────────
+  // Kite pushes order status changes as text/JSON on the same WebSocket.
+  // Resolves instantly on COMPLETE, rejects on REJECTED/CANCELLED.
+  // 30s hard timeout → falls through to REST fallback below.
+  try {
+    const result = await waitForOrderConfirmation(orderId, 30000);
+    console.log(`✅ [Socket] ${transactionType} ${tradingsymbol} COMPLETE | avgPrice=${result.avgPrice}`);
+    return { orderId, avgPrice: result.avgPrice };
+
+  } catch (socketErr) {
+    const isRejection = socketErr.message.startsWith("REJECTED:");
+    if (isRejection) throw socketErr; // hard stop — broker rejected, no fallback
+
+    // Socket timed out — Kite didn't push in 30s. Fall back to REST polling.
+    console.warn(`⚠️ Socket timeout for ${orderId} — falling back to REST: ${socketErr.message}`);
+    await sendCondorAlert(
+      `⚠️ <b>Order data delayed</b>\n` +
+      `${transactionType} ${tradingsymbol}\n` +
+      `Order ID: ${orderId}\n` +
+      `Kite socket gave no push in 30s — checking via REST every 2s\n` +
+      `⏳ Bot is waiting, position is being managed`
+    );
   }
 
-  // ── Phase 2: Background retry — poll every 2s indefinitely ──────────────────
-  // Order was placed on Kite but fill not confirmed in 5s (slow API / volatile open).
-  // We MUST keep polling — throwing here would abandon a potentially filled order.
-  // Callers are blocked waiting for this promise — no second order can fire.
-  console.warn(`⚠️ Kite: ${orderId} (${tradingsymbol}) not confirmed in 5s — entering background retry every 2s`);
-  await sendCondorAlert(
-    `⚠️ <b>Order confirm slow</b>\n` +
-    `${transactionType} ${tradingsymbol}\n` +
-    `Order ID: ${orderId}\n` +
-    `Not confirmed in 5s — polling Kite every 2s until definitive answer`
-  );
-
-  let attempt = 0;
-  while (true) {
-    attempt++;
+  // ── FALLBACK: REST poll — 20 attempts × 2s = 40s ─────────────────────────
+  // Only reached if socket push never arrived.
+  // Alerts Telegram once (above). Retries silently until definitive answer.
+  for (let attempt = 1; attempt <= 20; attempt++) {
     await new Promise(r => setTimeout(r, 2000));
     try {
       const orders = await kc.getOrders();
-      const found  = orders.find(o => o.order_id === orderId);
+      const found  = orders.find(o => String(o.order_id) === orderId);
+
       if (!found) {
-        console.warn(`⚠️ BG retry ${attempt}: ${orderId} still not in order book — waiting...`);
+        console.warn(`⚠️ [REST fallback] attempt ${attempt}/20: ${orderId} not in order book yet`);
         continue;
       }
+
       if (found.status === "COMPLETE") {
         const avgPrice = found.average_price || 0;
-        console.log(`✅ BG retry ${attempt}: ${orderId} COMPLETE | avgPrice=${avgPrice}`);
+        console.log(`✅ [REST fallback] ${orderId} COMPLETE | avgPrice=${avgPrice} (attempt ${attempt})`);
         await sendCondorAlert(
-          `✅ <b>Order confirmed (background)</b>\n` +
+          `✅ <b>Order confirmed via REST</b>\n` +
           `${transactionType} ${tradingsymbol}\n` +
           `Avg Price: ${avgPrice}\n` +
-          `Confirmed after ${attempt} background attempt(s)`
+          `(Socket timeout fallback — attempt ${attempt}/20)`
         );
         return { orderId, avgPrice };
       }
-      if (found.status === "REJECTED") {
-        throw new Error(`REJECTED: ${tradingsymbol} — ${found.status_message || "no reason"}`);
+
+      if (found.status === "REJECTED" || found.status === "CANCELLED") {
+        throw new Error(`REJECTED: ${tradingsymbol} — ${found.status_message || found.status}`);
       }
-      // OPEN / PENDING — keep waiting
-      console.warn(`⚠️ BG retry ${attempt}: ${orderId} status=${found.status} — still waiting...`);
+
+      // OPEN / UPDATE / PENDING — keep polling
+      console.warn(`⚠️ [REST fallback] attempt ${attempt}/20: ${orderId} status=${found.status}`);
+
     } catch (err) {
-      if (err.message.startsWith("REJECTED:")) throw err; // hard stop
-      console.warn(`⚠️ BG retry ${attempt}: getOrders error — retrying: ${err.message}`);
+      if (err.message.startsWith("REJECTED:")) throw err;
+      console.warn(`⚠️ [REST fallback] attempt ${attempt}/20 error: ${err.message}`);
     }
   }
+
+  // Both socket and REST exhausted — hard stop, manual intervention required
+  await sendCondorAlert(
+    `🚨 <b>Order UNCONFIRMED</b>\n` +
+    `${transactionType} ${tradingsymbol}\n` +
+    `Order ID: ${orderId}\n` +
+    `Socket + REST both gave no answer after ~70s\n` +
+    `⚠️ Check Kite manually — do NOT let bot trade again until resolved`
+  );
+  throw new Error(`Order ${orderId} (${tradingsymbol}): Unconfirmed after socket timeout + 20 REST attempts. Manual check required.`);
 };
 
 // ENTRY: BUY long leg first (confirmed), then SELL short leg (confirmed)

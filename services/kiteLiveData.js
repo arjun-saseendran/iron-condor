@@ -37,62 +37,97 @@ let _priceCallback = null;
 export const onPriceUpdate = (fn) => { _priceCallback = fn; };
 
 // ─── Order confirmation ───────────────────────────────────────────────────────
-// TWO sources can resolve a pending order — whichever arrives first wins:
-//   1. Kite Postback (HTTP POST to /api/orders/postback) — most reliable
-//   2. Kite WebSocket order_update — backup, arrives on same connection as ticks
+// RACE CONDITION FIX:
+// Kite postback or WebSocket order_update can arrive BEFORE placeOrder() returns
+// the order_id. This is a known Kite API behaviour.
 //
-// Both call _resolveOrder() internally.
-// waitForOrderConfirmation() registers the listener BEFORE placeOrder() is called
-// so neither postback nor WebSocket push can be missed.
-// Hard timeout of 60s → falls back to REST poll in ironCondorEngine.
+// Solution: buffer ALL incoming order updates immediately.
+// When waitForOrderConfirmation(orderId) is called after placeOrder():
+//   - Check buffer first — if update already arrived, resolve immediately
+//   - If not in buffer yet — register listener and wait for it
+//
+// TWO sources feed into the buffer — whichever arrives first wins:
+//   1. Kite Postback (HTTP POST to /api/orders/postback) — primary
+//   2. Kite WebSocket order_update — backup
+//
+// Hard timeout 60s → falls back to REST poll in ironCondorEngine.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Pending order confirmations: Map of orderId → { resolve, reject, timer }
+// Early arrival buffer: orderId → { status, avgPrice, reason, timestamp }
+// Holds updates that arrived before waitForOrderConfirmation() was called
+const _earlyBuffer = new Map();
+const BUFFER_TTL_MS = 120_000; // 2 minutes — clear stale buffer entries
+
+// Pending listeners: orderId → { resolve, reject, timer }
 const _pendingOrders = new Map();
 
-// ─── Internal: resolve or reject a pending order ─────────────────────────────
+// ─── Internal: process any incoming order update ──────────────────────────────
 function _resolveOrder(order, source) {
   const id     = String(order?.order_id ?? order?.orderId ?? "");
   const status = String(order?.status ?? "");
+  if (!id) return;
 
-  if (!id || !_pendingOrders.has(id)) return;
+  const avgPrice = order?.average_price ?? order?.avgPrice ?? 0;
+  const reason   = order?.status_message || status;
 
-  if (status === "COMPLETE") {
-    const { resolve, timer } = _pendingOrders.get(id);
+  console.log(`📬 [${source}] order_id=${id} status=${status} avgPrice=${avgPrice}`);
+
+  // ── If listener already waiting — resolve immediately ─────────────────────
+  if (_pendingOrders.has(id)) {
+    const { resolve, reject, timer } = _pendingOrders.get(id);
     clearTimeout(timer);
     _pendingOrders.delete(id);
-    const avgPrice = order?.average_price ?? order?.avgPrice ?? 0;
-    console.log(`✅ [${source}] Order ${id} COMPLETE | avgPrice=${avgPrice}`);
-    resolve({ orderId: id, avgPrice });
 
-  } else if (status === "REJECTED" || status === "CANCELLED") {
-    const { reject, timer } = _pendingOrders.get(id);
-    clearTimeout(timer);
-    _pendingOrders.delete(id);
-    const reason = order?.status_message || status;
-    console.error(`❌ [${source}] Order ${id} ${status}: ${reason}`);
-    reject(new Error(`REJECTED: ${order?.tradingsymbol ?? id} — ${reason}`));
+    if (status === "COMPLETE") {
+      console.log(`✅ [${source}] Order ${id} COMPLETE | avgPrice=${avgPrice}`);
+      resolve({ orderId: id, avgPrice });
+    } else if (status === "REJECTED" || status === "CANCELLED") {
+      console.error(`❌ [${source}] Order ${id} ${status}: ${reason}`);
+      reject(new Error(`REJECTED: ${order?.tradingsymbol ?? id} — ${reason}`));
+    }
+    // Non-terminal status — Kite will push again, keep listener alive
+    return;
   }
-  // All other statuses (OPEN, UPDATE, TRIGGER PENDING) → wait for final push
+
+  // ── Listener not registered yet — buffer the update ───────────────────────
+  // Only buffer terminal statuses — non-terminal will push again anyway
+  if (status === "COMPLETE" || status === "REJECTED" || status === "CANCELLED") {
+    _earlyBuffer.set(id, { status, avgPrice, reason, tradingsymbol: order?.tradingsymbol, timestamp: Date.now() });
+    // Auto-clean buffer after TTL to prevent memory leak
+    setTimeout(() => _earlyBuffer.delete(id), BUFFER_TTL_MS);
+  }
 }
 
 // ─── PUBLIC: called by server.js postback route ───────────────────────────────
-// Kite POSTs order updates to /api/orders/postback when orders fill/reject.
-// This is the PRIMARY confirmation method — more reliable than WebSocket push.
 export const resolveOrderFromPostback = (order) => {
-  const id     = String(order?.order_id ?? "");
-  const status = String(order?.status ?? "");
-  console.log(`📬 [Postback] order_id=${id} status=${status} avgPrice=${order?.average_price ?? 0}`);
   _resolveOrder(order, "Postback");
 };
 
 // ─── PUBLIC: called by ironCondorEngine's placeAndConfirm() ──────────────────
-// Register BEFORE placing the order so neither postback nor WebSocket is missed.
+// Call AFTER placeOrder() returns the orderId.
+// Checks buffer first — if update already arrived during placeOrder() gap,
+// resolves immediately without waiting.
 // Hard timeout 60s → falls back to REST poll in ironCondorEngine.
 export const waitForOrderConfirmation = (orderId, timeoutMs = 60000) => {
   return new Promise((resolve, reject) => {
     const id = String(orderId);
 
+    // ── Check early arrival buffer first ─────────────────────────────────────
+    if (_earlyBuffer.has(id)) {
+      const buffered = _earlyBuffer.get(id);
+      _earlyBuffer.delete(id);
+
+      if (buffered.status === "COMPLETE") {
+        console.log(`✅ [Buffer] Order ${id} already COMPLETE | avgPrice=${buffered.avgPrice}`);
+        resolve({ orderId: id, avgPrice: buffered.avgPrice });
+      } else {
+        console.error(`❌ [Buffer] Order ${id} already ${buffered.status}: ${buffered.reason}`);
+        reject(new Error(`REJECTED: ${buffered.tradingsymbol ?? id} — ${buffered.reason}`));
+      }
+      return; // resolved from buffer — no need to register listener
+    }
+
+    // ── Not in buffer — register listener for future push ────────────────────
     const timer = setTimeout(() => {
       _pendingOrders.delete(id);
       reject(new Error(`Order ${id}: No confirmation from Kite in ${timeoutMs / 1000}s (postback + socket both silent)`));
@@ -103,8 +138,6 @@ export const waitForOrderConfirmation = (orderId, timeoutMs = 60000) => {
 };
 
 // ─── Internal: handle incoming order_update from Kite WebSocket ───────────────
-// BACKUP — fires if postback didn't arrive first.
-// Both can fire safely — _resolveOrder() ignores already-resolved orders.
 function _handleOrderUpdate(order) {
   _resolveOrder(order, "WebSocket");
 }

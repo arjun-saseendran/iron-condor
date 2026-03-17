@@ -345,14 +345,12 @@ const placeAndConfirm = async (tradingsymbol, transactionType, quantity, index) 
 
   const kc = getKiteInstance();
 
-  // ── Register confirmation listener BEFORE placing order ───────────────────
-  // Kite postback or WebSocket order_update can arrive BEFORE placeOrder()
-  // returns the order_id (known race condition in Kite API).
-  // So we place the order, then immediately hand the order_id to the listener.
-  // waitForOrderConfirmation() is called right after we get the order_id —
-  // any postback/WebSocket that arrives after that point will be caught.
-  // If it arrived during the placeOrder() gap — REST fallback catches it.
-  // Hard timeout 60s → falls through to REST fallback below.
+  // ── Place order → get orderId → wait for confirmation ────────────────────
+  // kiteLiveData buffers ALL incoming order updates (postback + WebSocket).
+  // If Kite pushes COMPLETE/REJECTED before waitForOrderConfirmation() is called
+  // (known race condition), the update is held in _earlyBuffer and resolved
+  // instantly when waitForOrderConfirmation(orderId) checks it.
+  // No update can ever be missed regardless of timing.
   const order = await kc.placeOrder("regular", {
     exchange:          getKiteExchange(index),
     tradingsymbol,

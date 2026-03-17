@@ -36,40 +36,33 @@ export const getLastTickAge = () =>
 let _priceCallback = null;
 export const onPriceUpdate = (fn) => { _priceCallback = fn; };
 
-// ─── Order confirmation via WebSocket push ────────────────────────────────────
+// ─── Order confirmation ───────────────────────────────────────────────────────
+// TWO sources can resolve a pending order — whichever arrives first wins:
+//   1. Kite Postback (HTTP POST to /api/orders/postback) — most reliable
+//   2. Kite WebSocket order_update — backup, arrives on same connection as ticks
+//
+// Both call _resolveOrder() internally.
+// waitForOrderConfirmation() registers the listener BEFORE placeOrder() is called
+// so neither postback nor WebSocket push can be missed.
+// Hard timeout of 60s → falls back to REST poll in ironCondorEngine.
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Pending order confirmations: Map of orderId → { resolve, reject, timer }
 const _pendingOrders = new Map();
 
-// Called by ironCondorEngine's placeAndConfirm() instead of REST polling.
-// Resolves instantly when Kite pushes order_update with COMPLETE/REJECTED/CANCELLED.
-// Hard timeout of 30s → falls back to REST poll in ironCondorEngine.
-export const waitForOrderConfirmation = (orderId, timeoutMs = 30000) => {
-  return new Promise((resolve, reject) => {
-    const id = String(orderId);
-
-    const timer = setTimeout(() => {
-      _pendingOrders.delete(id);
-      reject(new Error(`Order ${id}: No confirmation from Kite order socket in ${timeoutMs / 1000}s`));
-    }, timeoutMs);
-
-    _pendingOrders.set(id, { resolve, reject, timer });
-  });
-};
-
-// ─── Internal: handle incoming order_update from Kite WebSocket ───────────────
-function _handleOrderUpdate(order) {
-  const id     = String(order?.order_id ?? "");
-  const status = order?.status; // "COMPLETE", "REJECTED", "CANCELLED", "OPEN", "UPDATE"...
+// ─── Internal: resolve or reject a pending order ─────────────────────────────
+function _resolveOrder(order, source) {
+  const id     = String(order?.order_id ?? order?.orderId ?? "");
+  const status = String(order?.status ?? "");
 
   if (!id || !_pendingOrders.has(id)) return;
 
-  // Only resolve/reject on terminal statuses — ignore UPDATE/OPEN/PENDING
   if (status === "COMPLETE") {
     const { resolve, timer } = _pendingOrders.get(id);
     clearTimeout(timer);
     _pendingOrders.delete(id);
-    const avgPrice = order?.average_price ?? 0;
-    console.log(`✅ [KiteTicker] Order ${id} COMPLETE | avgPrice=${avgPrice}`);
+    const avgPrice = order?.average_price ?? order?.avgPrice ?? 0;
+    console.log(`✅ [${source}] Order ${id} COMPLETE | avgPrice=${avgPrice}`);
     resolve({ orderId: id, avgPrice });
 
   } else if (status === "REJECTED" || status === "CANCELLED") {
@@ -77,10 +70,43 @@ function _handleOrderUpdate(order) {
     clearTimeout(timer);
     _pendingOrders.delete(id);
     const reason = order?.status_message || status;
-    console.error(`❌ [KiteTicker] Order ${id} ${status}: ${reason}`);
+    console.error(`❌ [${source}] Order ${id} ${status}: ${reason}`);
     reject(new Error(`REJECTED: ${order?.tradingsymbol ?? id} — ${reason}`));
   }
-  // All other statuses (OPEN, UPDATE, TRIGGER PENDING) → Kite will push again when final
+  // All other statuses (OPEN, UPDATE, TRIGGER PENDING) → wait for final push
+}
+
+// ─── PUBLIC: called by server.js postback route ───────────────────────────────
+// Kite POSTs order updates to /api/orders/postback when orders fill/reject.
+// This is the PRIMARY confirmation method — more reliable than WebSocket push.
+export const resolveOrderFromPostback = (order) => {
+  const id     = String(order?.order_id ?? "");
+  const status = String(order?.status ?? "");
+  console.log(`📬 [Postback] order_id=${id} status=${status} avgPrice=${order?.average_price ?? 0}`);
+  _resolveOrder(order, "Postback");
+};
+
+// ─── PUBLIC: called by ironCondorEngine's placeAndConfirm() ──────────────────
+// Register BEFORE placing the order so neither postback nor WebSocket is missed.
+// Hard timeout 60s → falls back to REST poll in ironCondorEngine.
+export const waitForOrderConfirmation = (orderId, timeoutMs = 60000) => {
+  return new Promise((resolve, reject) => {
+    const id = String(orderId);
+
+    const timer = setTimeout(() => {
+      _pendingOrders.delete(id);
+      reject(new Error(`Order ${id}: No confirmation from Kite in ${timeoutMs / 1000}s (postback + socket both silent)`));
+    }, timeoutMs);
+
+    _pendingOrders.set(id, { resolve, reject, timer });
+  });
+};
+
+// ─── Internal: handle incoming order_update from Kite WebSocket ───────────────
+// BACKUP — fires if postback didn't arrive first.
+// Both can fire safely — _resolveOrder() ignores already-resolved orders.
+function _handleOrderUpdate(order) {
+  _resolveOrder(order, "WebSocket");
 }
 
 // ─── Connect ──────────────────────────────────────────────────────────────────

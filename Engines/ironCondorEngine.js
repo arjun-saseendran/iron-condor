@@ -343,7 +343,16 @@ const placeAndConfirm = async (tradingsymbol, transactionType, quantity, index) 
     return { orderId: id, avgPrice };
   }
 
-  const kc    = getKiteInstance();
+  const kc = getKiteInstance();
+
+  // ── Register confirmation listener BEFORE placing order ───────────────────
+  // Kite postback or WebSocket order_update can arrive BEFORE placeOrder()
+  // returns the order_id (known race condition in Kite API).
+  // So we place the order, then immediately hand the order_id to the listener.
+  // waitForOrderConfirmation() is called right after we get the order_id —
+  // any postback/WebSocket that arrives after that point will be caught.
+  // If it arrived during the placeOrder() gap — REST fallback catches it.
+  // Hard timeout 60s → falls through to REST fallback below.
   const order = await kc.placeOrder("regular", {
     exchange:          getKiteExchange(index),
     tradingsymbol,
@@ -357,26 +366,27 @@ const placeAndConfirm = async (tradingsymbol, transactionType, quantity, index) 
   const orderId = String(order.order_id);
   console.log(`⏳ Kite: ${transactionType} ${tradingsymbol} → waiting confirm (${orderId})`);
 
-  // ── PRIMARY: KiteTicker order_update push ─────────────────────────────────
-  // Kite pushes order status changes as text/JSON on the same WebSocket.
-  // Resolves instantly on COMPLETE, rejects on REJECTED/CANCELLED.
-  // 30s hard timeout → falls through to REST fallback below.
+  // ── PRIMARY: Postback + WebSocket — whichever arrives first wins ──────────
+  // waitForOrderConfirmation() registers under orderId immediately after placement.
+  // Postback (HTTP POST) is primary — independent of WebSocket connection.
+  // WebSocket order_update is backup — same connection as price ticks.
+  // 60s timeout → falls through to REST fallback below.
   try {
-    const result = await waitForOrderConfirmation(orderId, 30000);
-    console.log(`✅ [Socket] ${transactionType} ${tradingsymbol} COMPLETE | avgPrice=${result.avgPrice}`);
+    const result = await waitForOrderConfirmation(orderId, 60000);
+    console.log(`✅ [Confirmed] ${transactionType} ${tradingsymbol} COMPLETE | avgPrice=${result.avgPrice}`);
     return { orderId, avgPrice: result.avgPrice };
 
-  } catch (socketErr) {
-    const isRejection = socketErr.message.startsWith("REJECTED:");
-    if (isRejection) throw socketErr; // hard stop — broker rejected, no fallback
+  } catch (confirmErr) {
+    const isRejection = confirmErr.message.startsWith("REJECTED:");
+    if (isRejection) throw confirmErr; // hard stop — broker rejected, no fallback
 
-    // Socket timed out — Kite didn't push in 30s. Fall back to REST polling.
-    console.warn(`⚠️ Socket timeout for ${orderId} — falling back to REST: ${socketErr.message}`);
+    // Both postback and WebSocket silent for 60s — fall back to REST polling
+    console.warn(`⚠️ No postback/socket confirmation for ${orderId} in 60s — falling back to REST`);
     await sendCondorAlert(
-      `⚠️ <b>Order data delayed</b>\n` +
+      `⚠️ <b>Order confirmation delayed</b>\n` +
       `${transactionType} ${tradingsymbol}\n` +
       `Order ID: ${orderId}\n` +
-      `Kite socket gave no push in 30s — checking via REST every 2s\n` +
+      `Postback + WebSocket both silent for 60s — checking via REST\n` +
       `⏳ Bot is waiting, position is being managed`
     );
   }

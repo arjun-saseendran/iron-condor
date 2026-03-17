@@ -24,6 +24,7 @@ import { sendTelegramAlert } from "./services/telegramService.js";
 import {
   initKiteLiveData,
   subscribeCondorToken,
+  resolveOrderFromPostback,
 } from "./services/kiteLiveData.js";
 import { kiteSymbolToToken } from "./services/kiteSymbolMapper.js";
 
@@ -76,6 +77,27 @@ app.use("/api/options", optionsRoutes);
 app.use("/api/positions", positionRoutes);
 app.use("/api/auto-condor", autoCondorRoutes);
 app.use("/api/condor", condorRoutes);
+
+// ─── Kite Postback — order fill confirmation ──────────────────────────────────
+// Kite POSTs order status updates here when orders fill, reject, or cancel.
+// Set this URL in Kite developer console → App Settings → Postback URL:
+//   https://api.mariaalgo.online/api/orders/postback
+//
+// This is the PRIMARY order confirmation method — more reliable than WebSocket
+// because it is an independent HTTP POST, not affected by ticker disconnects.
+// WebSocket order_update remains as backup — whichever arrives first wins.
+// Always respond 200 immediately so Kite does not retry the postback.
+app.post("/api/orders/postback", (req, res) => {
+  res.sendStatus(200); // respond immediately — Kite retries if no 200
+  try {
+    const order = req.body;
+    if (order?.order_id && order?.status) {
+      resolveOrderFromPostback(order);
+    }
+  } catch (err) {
+    console.error("❌ Postback handler error:", err.message);
+  }
+});
 
 // ─── Trade History ────────────────────────────────────────────────────────────
 app.get("/api/history", async (req, res) => {

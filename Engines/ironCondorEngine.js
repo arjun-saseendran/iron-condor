@@ -881,51 +881,65 @@ export const executeFirefight = async (trade, profitSide) => {
     }
 
     // 1st SL — enter both fresh spreads
-    const spot    = await getSpotPrice(trade.index);
-    const strikes = await fetchFullOptionChain(trade.index, trade.expiry);
+    try {
+      const spot    = await getSpotPrice(trade.index);
+      const strikes = await fetchFullOptionChain(trade.index, trade.expiry);
 
-    // Fresh losing side
-    const losingRepl     = findReplacementSpread(strikes, spot, trade.index, losingSide);
-    const losingOptType  = losingSide === "call" ? "CE" : "PE";
-    const newLosingSell  = buildKiteSymbol(trade.index, trade.expiry, losingRepl.sell.strike, losingOptType);
-    const newLosingBuy   = buildKiteSymbol(trade.index, trade.expiry, losingRepl.buy.strike,  losingOptType);
-    if (losingSide === "call") { cacheAndSubscribe(newLosingSell, losingRepl.sell.callKey); cacheAndSubscribe(newLosingBuy, losingRepl.buy.callKey); }
-    else                       { cacheAndSubscribe(newLosingSell, losingRepl.sell.putKey);  cacheAndSubscribe(newLosingBuy, losingRepl.buy.putKey);  }
-    const losingOrders   = await enterSpread(newLosingSell, newLosingBuy, trade.quantity, trade.index);
-    const newLosingEntry = losingOrders.actualNet;
+      // Fresh losing side
+      const losingRepl     = findReplacementSpread(strikes, spot, trade.index, losingSide);
+      const losingOptType  = losingSide === "call" ? "CE" : "PE";
+      const newLosingSell  = buildKiteSymbol(trade.index, trade.expiry, losingRepl.sell.strike, losingOptType);
+      const newLosingBuy   = buildKiteSymbol(trade.index, trade.expiry, losingRepl.buy.strike,  losingOptType);
+      if (losingSide === "call") { cacheAndSubscribe(newLosingSell, losingRepl.sell.callKey); cacheAndSubscribe(newLosingBuy, losingRepl.buy.callKey); }
+      else                       { cacheAndSubscribe(newLosingSell, losingRepl.sell.putKey);  cacheAndSubscribe(newLosingBuy, losingRepl.buy.putKey);  }
+      const losingOrders   = await enterSpread(newLosingSell, newLosingBuy, trade.quantity, trade.index);
+      const newLosingEntry = losingOrders.actualNet;
 
-    // Fresh profit side
-    const profitRepl     = findReplacementSpread(strikes, spot, trade.index, profitSide);
-    const profitOptType  = profitSide === "call" ? "CE" : "PE";
-    const newProfitSell  = buildKiteSymbol(trade.index, trade.expiry, profitRepl.sell.strike, profitOptType);
-    const newProfitBuy   = buildKiteSymbol(trade.index, trade.expiry, profitRepl.buy.strike,  profitOptType);
-    if (profitSide === "call") { cacheAndSubscribe(newProfitSell, profitRepl.sell.callKey); cacheAndSubscribe(newProfitBuy, profitRepl.buy.callKey); }
-    else                       { cacheAndSubscribe(newProfitSell, profitRepl.sell.putKey);  cacheAndSubscribe(newProfitBuy, profitRepl.buy.putKey);  }
-    const profitOrders   = await enterSpread(newProfitSell, newProfitBuy, trade.quantity, trade.index);
-    const newProfitEntry = profitOrders.actualNet;
+      // Fresh profit side
+      const profitRepl     = findReplacementSpread(strikes, spot, trade.index, profitSide);
+      const profitOptType  = profitSide === "call" ? "CE" : "PE";
+      const newProfitSell  = buildKiteSymbol(trade.index, trade.expiry, profitRepl.sell.strike, profitOptType);
+      const newProfitBuy   = buildKiteSymbol(trade.index, trade.expiry, profitRepl.buy.strike,  profitOptType);
+      if (profitSide === "call") { cacheAndSubscribe(newProfitSell, profitRepl.sell.callKey); cacheAndSubscribe(newProfitBuy, profitRepl.buy.callKey); }
+      else                       { cacheAndSubscribe(newProfitSell, profitRepl.sell.putKey);  cacheAndSubscribe(newProfitBuy, profitRepl.buy.putKey);  }
+      const profitOrders   = await enterSpread(newProfitSell, newProfitBuy, trade.quantity, trade.index);
+      const newProfitEntry = profitOrders.actualNet;
 
-    // Update DB — both sides fresh
-    const upd = {
-      slCount: newSlCount, bufferPremium: 0, postSlFirefightDone: false,
-      slBookedLoss: (trade.slBookedLoss || 0) + slLossBooked,
-      firefightPending: false, firefightSide: null,
-      totalEntryPremium: newLosingEntry + newProfitEntry,
-    };
-    if (losingSide === "call") {
-      upd["symbols.callSell"] = newLosingSell; upd["symbols.callBuy"] = newLosingBuy; upd["callSpreadEntryPremium"] = newLosingEntry;
-      upd["symbols.putSell"]  = newProfitSell; upd["symbols.putBuy"]  = newProfitBuy; upd["putSpreadEntryPremium"]  = newProfitEntry;
-    } else {
-      upd["symbols.putSell"]  = newLosingSell; upd["symbols.putBuy"]  = newLosingBuy; upd["putSpreadEntryPremium"]  = newLosingEntry;
-      upd["symbols.callSell"] = newProfitSell; upd["symbols.callBuy"] = newProfitBuy; upd["callSpreadEntryPremium"] = newProfitEntry;
+      // Update DB — both sides fresh
+      const upd = {
+        slCount: newSlCount, bufferPremium: 0, postSlFirefightDone: false,
+        slBookedLoss: (trade.slBookedLoss || 0) + slLossBooked,
+        firefightPending: false, firefightSide: null,
+        totalEntryPremium: newLosingEntry + newProfitEntry,
+      };
+      if (losingSide === "call") {
+        upd["symbols.callSell"] = newLosingSell; upd["symbols.callBuy"] = newLosingBuy; upd["callSpreadEntryPremium"] = newLosingEntry;
+        upd["symbols.putSell"]  = newProfitSell; upd["symbols.putBuy"]  = newProfitBuy; upd["putSpreadEntryPremium"]  = newProfitEntry;
+      } else {
+        upd["symbols.putSell"]  = newLosingSell; upd["symbols.putBuy"]  = newLosingBuy; upd["putSpreadEntryPremium"]  = newLosingEntry;
+        upd["symbols.callSell"] = newProfitSell; upd["symbols.callBuy"] = newProfitBuy; upd["callSpreadEntryPremium"] = newProfitEntry;
+      }
+      await ActiveTrade.updateOne({ _id: trade._id }, { $set: upd });
+      await sendCondorAlert(
+        `✅ <b>Both Sides Reset</b> · ${trade.index}\n` +
+        `${profitSide}: SELL ${newProfitSell} / BUY ${newProfitBuy} · Net: ${newProfitEntry.toFixed(2)}\n` +
+        `${losingSide}: SELL ${newLosingSell} / BUY ${newLosingBuy} · Net: ${newLosingEntry.toFixed(2)}\n` +
+        `slCount: ${newSlCount} · Buffer: reset to 0`
+      );
+      condorLog(`✅ BOTH SIDES RESET | slCount=${newSlCount}`, "warn");
+    } catch (resetErr) {
+      // Both spreads exited but fresh entry failed — alert and mark completed
+      condorLog(`🚨 BOTH SIDES RESET FAILED — ${resetErr.message}`, "error");
+      await ActiveTrade.updateOne({ _id: trade._id }, { $set: {
+        slCount: newSlCount, status: "COMPLETED",
+        slBookedLoss: (trade.slBookedLoss || 0) + slLossBooked,
+      }});
+      await sendCondorAlert(
+        `🚨 <b>RESET FAILED</b> · ${trade.index}\n` +
+        `Both sides exited but fresh entry failed: ${resetErr.message}\n` +
+        `⚠️ No open positions — manual re-entry required`
+      );
     }
-    await ActiveTrade.updateOne({ _id: trade._id }, { $set: upd });
-    await sendCondorAlert(
-      `✅ <b>Both Sides Reset</b> · ${trade.index}\n` +
-      `${profitSide}: SELL ${newProfitSell} / BUY ${newProfitBuy} · Net: ${newProfitEntry.toFixed(2)}\n` +
-      `${losingSide}: SELL ${newLosingSell} / BUY ${newLosingBuy} · Net: ${newLosingEntry.toFixed(2)}\n` +
-      `slCount: ${newSlCount} · Buffer: reset to 0`
-    );
-    condorLog(`✅ BOTH SIDES RESET | slCount=${newSlCount}`, "warn");
     return;
   }
 
@@ -955,20 +969,6 @@ export const executeFirefight = async (trade, profitSide) => {
     return;
   }
 
-  // actual premium received on exit = what we paid to close sell leg (buyBack) minus what we received to close buy leg (sellClose)
-  // net cost to close = exitResult.buyBackAvg - exitResult.sellCloseAvg
-  // actual profit booked = entry premium - net cost to close
-  const exitNetCost   = Math.max(0, exitResult.buyBackAvg - exitResult.sellCloseAvg);
-  const profitBooked  = Math.max(0, profitEntry - exitNetCost);
-  const newBuffer     = (trade.bufferPremium || 0) + profitBooked;
-
-  console.log(`⚔️ Firefight exit: buyBackAvg=${exitResult.buyBackAvg} sellCloseAvg=${exitResult.sellCloseAvg} exitNetCost=${exitNetCost.toFixed(2)} booked=${profitBooked.toFixed(2)}`);
-
-  // 2. Fresh chain → find replacement
-  const spot        = await getSpotPrice(trade.index);
-  const strikes     = await fetchFullOptionChain(trade.index, trade.expiry);
-  const replacement = findReplacementSpread(strikes, spot, trade.index, profitSide);
-
   const optType    = profitSide === "call" ? "CE" : "PE";
   const newSellSym = buildKiteSymbol(trade.index, trade.expiry, replacement.sell.strike, optType);
   const newBuySym  = buildKiteSymbol(trade.index, trade.expiry, replacement.buy.strike,  optType);
@@ -986,8 +986,7 @@ export const executeFirefight = async (trade, profitSide) => {
   const newEntry  = newOrders.actualNet; // actual fill from Kite
 
   // 4. Update DB
-  const losingEntry = profitSide === "call" ? trade.putSpreadEntryPremium : trade.callSpreadEntryPremium;
-  const newSL       = slLevel(losingEntry, newBuffer);
+  const newSL = slLevel(losingEntry, newBuffer);
 
   const upd = {
     bufferPremium:    newBuffer,

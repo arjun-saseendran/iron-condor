@@ -1555,9 +1555,33 @@ export const reconcileKitePositions = async () => {
     updateKitePositions(netPositions);
     updateKiteOrders(orders || []);
 
-    // ── Job 1: existing trade — just refresh cache ────────────────────────
+    // ── Job 1: existing trade — refresh cache + ensure tokens subscribed ─────
     if (trade) {
       console.log("🔄 Kite positions reconciled");
+
+      // ✅ FIX: Subscribe tokens for active trade legs on every reconcile.
+      // On restart, kiteSymbolMapper cache is empty — tokens must be re-fetched.
+      // Use getLTP() — fast, fetches tokens for just our 4 symbols directly.
+      const syms = [
+        trade.symbols.callSell, trade.symbols.callBuy,
+        trade.symbols.putSell,  trade.symbols.putBuy,
+      ].filter(Boolean);
+
+      if (syms.length > 0) {
+        const exchPrefix = trade.index === "SENSEX" ? "BFO" : "NFO";
+        try {
+          const ltpKeys = syms.map(s => `${exchPrefix}:${s}`);
+          const ltpData = await kc.getLTP(ltpKeys);
+          let subscribed = 0;
+          for (const sym of syms) {
+            const token = ltpData?.[`${exchPrefix}:${sym}`]?.instrument_token;
+            if (token) { cacheAndSubscribe(sym, token); subscribed++; }
+          }
+          if (subscribed > 0) console.log(`✅ Subscribed ${subscribed} tokens for active trade`);
+        } catch (e) {
+          console.warn("⚠️ Token re-subscription failed:", e.message);
+        }
+      }
       return;
     }
 

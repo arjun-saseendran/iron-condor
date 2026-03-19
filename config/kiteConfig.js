@@ -17,6 +17,8 @@ export const loadTokenFromDB = async () => {
   if (saved?.accessToken) {
     dailyAccessToken = saved.accessToken;
     kc.setAccessToken(saved.accessToken);
+    // ✅ FIX: also set in process.env so kiteLiveData.js WebSocket can read it
+    process.env.KITE_ACCESS_TOKEN = saved.accessToken;
     console.log("✅ Kite access token loaded from DB");
     return saved.accessToken;
   }
@@ -28,6 +30,8 @@ export const loadTokenFromDB = async () => {
 export const setAccessToken = (token) => {
   dailyAccessToken = token;
   kc.setAccessToken(token);
+  // ✅ FIX: also set in process.env so kiteLiveData.js WebSocket can read it
+  process.env.KITE_ACCESS_TOKEN = token;
   console.log("✅ Kite access token set in memory");
 };
 

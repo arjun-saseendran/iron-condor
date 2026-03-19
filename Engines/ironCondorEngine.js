@@ -1469,8 +1469,11 @@ export const scanAndSyncOrders = async () => {
   // P&L from live WebSocket prices — no REST needed
   const livePnL = (hasCall ? (callEntry - callNet) : 0) * trade.quantity
                 + (hasPut  ? (putEntry  - putNet)  : 0) * trade.quantity;
-  const kitePnl = getKitePnL(trade); // uses cached REST data updated by reconcileKitePositions
-  const pnl     = kitePnl !== null ? kitePnl : livePnL;
+  // ✅ FIX: Use live WebSocket P&L as primary — updates every tick (real-time).
+  //         Kite REST P&L only as fallback when no live prices available.
+  //         Previously REST was primary causing slow P&L updates (60s delay).
+  const kitePnl = getKitePnL(trade);
+  const pnl     = (callNet > 0 || putNet > 0) ? livePnL : (kitePnl ?? livePnL);
 
   const io = getIO();
   if (io) {
@@ -1480,7 +1483,7 @@ export const scanAndSyncOrders = async () => {
       isButterfly:      trade.isIronButterfly,
       slCount:          trade.slCount,
       pnl:              pnl.toFixed(2),
-      pnlSource:        kitePnl !== null ? "kite" : "live",
+      pnlSource:        (callNet > 0 || putNet > 0) ? "live" : (kitePnl !== null ? "kite" : "live"),
       buffer:           buffer.toFixed(2),
       expiry:           trade.expiry,
       call: {

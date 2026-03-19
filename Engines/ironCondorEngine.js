@@ -345,12 +345,14 @@ const placeAndConfirm = async (tradingsymbol, transactionType, quantity, index) 
 
   const kc = getKiteInstance();
 
-  // ── Place order → get orderId → wait for confirmation ────────────────────
-  // kiteLiveData buffers ALL incoming order updates (postback + WebSocket).
-  // If Kite pushes COMPLETE/REJECTED before waitForOrderConfirmation() is called
-  // (known race condition), the update is held in _earlyBuffer and resolved
-  // instantly when waitForOrderConfirmation(orderId) checks it.
-  // No update can ever be missed regardless of timing.
+  // ── Register confirmation listener BEFORE placing order ───────────────────
+  // Kite postback or WebSocket order_update can arrive BEFORE placeOrder()
+  // returns the order_id (known race condition in Kite API).
+  // So we place the order, then immediately hand the order_id to the listener.
+  // waitForOrderConfirmation() is called right after we get the order_id —
+  // any postback/WebSocket that arrives after that point will be caught.
+  // If it arrived during the placeOrder() gap — REST fallback catches it.
+  // Hard timeout 60s → falls through to REST fallback below.
   const order = await kc.placeOrder("regular", {
     exchange:          getKiteExchange(index),
     tradingsymbol,
@@ -694,13 +696,25 @@ export const importTradeFromKite = async (index, quantity, mode = "SEMI_AUTO") =
   const totalEntry = callEntry + putEntry;
 
   // Subscribe to live prices for all legs
-  const instruments = await kc.getInstruments([exchange]);
-  const findToken = (sym) => instruments.find(i => i.tradingsymbol === sym)?.instrument_token || null;
-
-  if (callSell) cacheAndSubscribe(callSell.tradingsymbol, findToken(callSell.tradingsymbol));
-  if (callBuy)  cacheAndSubscribe(callBuy.tradingsymbol,  findToken(callBuy.tradingsymbol));
-  if (putSell)  cacheAndSubscribe(putSell.tradingsymbol,  findToken(putSell.tradingsymbol));
-  if (putBuy)   cacheAndSubscribe(putBuy.tradingsymbol,   findToken(putBuy.tradingsymbol));
+  // ✅ FIX: Use getLTP() instead of getInstruments() — faster and doesn't timeout for BFO
+  const symsToSub  = [callSell, callBuy, putSell, putBuy].filter(Boolean).map(p => p.tradingsymbol);
+  const exchPrefix = exchange === "BFO" ? "BFO" : "NFO";
+  try {
+    const ltpKeys = symsToSub.map(s => `${exchPrefix}:${s}`);
+    const ltpData = await kc.getLTP(ltpKeys);
+    for (const sym of symsToSub) {
+      const token = ltpData?.[`${exchPrefix}:${sym}`]?.instrument_token;
+      if (token) cacheAndSubscribe(sym, token);
+    }
+  } catch (e) {
+    console.warn("⚠️ Token subscription via LTP failed:", e.message);
+    const instruments = await kc.getInstruments([exchange]);
+    const findToken = (sym) => instruments.find(i => i.tradingsymbol === sym)?.instrument_token || null;
+    if (callSell) cacheAndSubscribe(callSell.tradingsymbol, findToken(callSell.tradingsymbol));
+    if (callBuy)  cacheAndSubscribe(callBuy.tradingsymbol,  findToken(callBuy.tradingsymbol));
+    if (putSell)  cacheAndSubscribe(putSell.tradingsymbol,  findToken(putSell.tradingsymbol));
+    if (putBuy)   cacheAndSubscribe(putBuy.tradingsymbol,   findToken(putBuy.tradingsymbol));
+  }
 
   const trade = await ActiveTrade.create({
     index,
@@ -1603,12 +1617,32 @@ export const reconcileKitePositions = async () => {
                        :                                 "ONE_SIDE_PUT";
 
     // Subscribe to live prices for all found legs
-    const instruments = await kc.getInstruments([exchange]);
-    const findToken   = (sym) => instruments.find(i => i.tradingsymbol === sym)?.instrument_token || null;
-    if (callSell) cacheAndSubscribe(callSell.tradingsymbol, findToken(callSell.tradingsymbol));
-    if (callBuy)  cacheAndSubscribe(callBuy.tradingsymbol,  findToken(callBuy.tradingsymbol));
-    if (putSell)  cacheAndSubscribe(putSell.tradingsymbol,  findToken(putSell.tradingsymbol));
-    if (putBuy)   cacheAndSubscribe(putBuy.tradingsymbol,   findToken(putBuy.tradingsymbol));
+    // ✅ FIX: kc.getInstruments(["BFO"]) downloads 50k+ rows and often times out
+    //         for SENSEX symbols. Use getLTP() instead — fetches tokens directly
+    //         for just our 4 symbols, fast and reliable.
+    const symsToSubscribe = [
+      callSell?.tradingsymbol, callBuy?.tradingsymbol,
+      putSell?.tradingsymbol,  putBuy?.tradingsymbol,
+    ].filter(Boolean);
+
+    try {
+      const exchPrefix = exchange === "BFO" ? "BFO" : "NFO";
+      const ltpKeys    = symsToSubscribe.map(s => `${exchPrefix}:${s}`);
+      const ltpData    = await kc.getLTP(ltpKeys);
+      for (const sym of symsToSubscribe) {
+        const key   = `${exchPrefix}:${sym}`;
+        const token = ltpData?.[key]?.instrument_token;
+        if (token) cacheAndSubscribe(sym, token);
+      }
+    } catch (e) {
+      console.warn("⚠️ Token subscription via LTP failed — trying getInstruments fallback:", e.message);
+      const instruments = await kc.getInstruments([exchange]);
+      const findToken   = (sym) => instruments.find(i => i.tradingsymbol === sym)?.instrument_token || null;
+      if (callSell) cacheAndSubscribe(callSell.tradingsymbol, findToken(callSell.tradingsymbol));
+      if (callBuy)  cacheAndSubscribe(callBuy.tradingsymbol,  findToken(callBuy.tradingsymbol));
+      if (putSell)  cacheAndSubscribe(putSell.tradingsymbol,  findToken(putSell.tradingsymbol));
+      if (putBuy)   cacheAndSubscribe(putBuy.tradingsymbol,   findToken(putBuy.tradingsymbol));
+    }
 
     const expiry = getNearestExpiry(index);
     const mode   = process.env.DEFAULT_MODE || "SEMI_AUTO";

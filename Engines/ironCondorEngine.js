@@ -1475,6 +1475,8 @@ export const scanAndSyncOrders = async () => {
   const trade = await _getActiveTrade();
   if (!trade) return;
 
+  const ActiveTrade = getActiveTradeModel(); // needed for stale feed check below
+
   const hasCall    = !!(trade.symbols.callSell && trade.symbols.callBuy && trade.callSpreadEntryPremium > 0);
   const hasPut     = !!(trade.symbols.putSell  && trade.symbols.putBuy  && trade.putSpreadEntryPremium  > 0);
   const callNet    = hasCall ? getCallNet(trade) : 0;

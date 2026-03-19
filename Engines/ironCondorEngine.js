@@ -820,15 +820,140 @@ export const executeFirefight = async (trade, profitSide) => {
 
   const profitEntry = profitSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
   const losingSide  = profitSide === "call" ? "put" : "call";
+  const losingEntry = losingSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
+  const buffer      = trade.bufferPremium || 0;
+  const losingSL    = slLevel(losingEntry, buffer);
+
+  // ✅ FIX 1: Check losing side SL BEFORE placing any orders.
+  // If losing side already at SL — abort FF, run SL reset instead.
+  const losingNetBefore = losingSide === "call" ? getCallNet(trade) : getPutNet(trade);
+  if (losingNetBefore >= losingSL) {
+    condorLog(`⚠️ FF ABORTED — ${losingSide} already at SL (${losingNetBefore.toFixed(2)} ≥ ${losingSL.toFixed(2)}) — running SL reset`, "error");
+    await sendCondorAlert(
+      `⚠️ <b>Firefight Aborted</b> · ${trade.index}\n` +
+      `${losingSide} already at SL: ${losingNetBefore.toFixed(2)} ≥ ${losingSL.toFixed(2)}\n` +
+      `Running SL reset instead`
+    );
+    await executeSLReset(trade, losingSide);
+    return;
+  }
 
   condorLog(`⚔️ FIREFIGHT triggered | exit ${profitSide} side | entry=${profitEntry.toFixed(2)}`, "warn");
 
-  // 1. Exit profit side — get actual filled prices from Kite
+  // 1. Exit profit side
   const profitSellSym = profitSide === "call" ? trade.symbols.callSell : trade.symbols.putSell;
   const profitBuySym  = profitSide === "call" ? trade.symbols.callBuy  : trade.symbols.putBuy;
+  const exitResult    = await exitSpreadWithFill(profitSellSym, profitBuySym, trade.quantity, trade.index);
 
-  // exitSpread returns actual fill prices — buyBack avg and sellClose avg
-  const exitResult = await exitSpreadWithFill(profitSellSym, profitBuySym, trade.quantity, trade.index);
+  const exitNetCost  = Math.max(0, exitResult.buyBackAvg - exitResult.sellCloseAvg);
+  const profitBooked = Math.max(0, profitEntry - exitNetCost);
+  const newBuffer    = (trade.bufferPremium || 0) + profitBooked;
+
+  console.log(`⚔️ Firefight exit: buyBackAvg=${exitResult.buyBackAvg} sellCloseAvg=${exitResult.sellCloseAvg} exitNetCost=${exitNetCost.toFixed(2)} booked=${profitBooked.toFixed(2)}`);
+
+  // ✅ FIX 2: After profit side exited — check if losing side hit SL DURING exit.
+  // If yes — exit losing side immediately, then enter BOTH fresh spreads.
+  // This is the correct strategy: don't leave losing side bleeding while fetching chain.
+  const losingNetAfter = losingSide === "call" ? getCallNet(trade) : getPutNet(trade);
+  if (losingNetAfter >= losingSL) {
+    condorLog(`🔴 SL hit on ${losingSide} DURING firefight exit — exiting losing side + entering both fresh spreads`, "error");
+    await sendCondorAlert(
+      `🔴 <b>SL Hit During Firefight</b> · ${trade.index}\n` +
+      `✅ ${profitSide} exited (booked ₹${profitBooked.toFixed(2)})\n` +
+      `🔴 ${losingSide} hit SL during exit: ${losingNetAfter.toFixed(2)} ≥ ${losingSL.toFixed(2)}\n` +
+      `Exiting ${losingSide} + entering both fresh spreads now`
+    );
+
+    // Exit losing side
+    const losingSellSym = losingSide === "call" ? trade.symbols.callSell : trade.symbols.putSell;
+    const losingBuySym  = losingSide === "call" ? trade.symbols.callBuy  : trade.symbols.putBuy;
+    const slExitResult  = await exitSpreadWithFill(losingSellSym, losingBuySym, trade.quantity, trade.index);
+    const slExitCost    = Math.max(0, slExitResult.buyBackAvg - slExitResult.sellCloseAvg);
+    const slLossBooked  = Math.max(0, slExitCost - losingEntry) * trade.quantity;
+    const newSlCount    = (trade.slCount || 0) + 1;
+
+    // 2nd SL — exit all, done for day
+    if (newSlCount >= 2) {
+      await ActiveTrade.updateOne({ _id: trade._id }, { $set: { slCount: newSlCount, status: "COMPLETED" } });
+      await sendCondorAlert(`🛑 <b>2nd SL HIT</b> · ${trade.index} · Both sides exited. Done for day.`);
+      condorLog(`🛑 2nd SL — done for day`, "error");
+      return;
+    }
+
+    // 1st SL — enter both fresh spreads
+    const spot    = await getSpotPrice(trade.index);
+    const strikes = await fetchFullOptionChain(trade.index, trade.expiry);
+
+    // Fresh losing side
+    const losingRepl     = findReplacementSpread(strikes, spot, trade.index, losingSide);
+    const losingOptType  = losingSide === "call" ? "CE" : "PE";
+    const newLosingSell  = buildKiteSymbol(trade.index, trade.expiry, losingRepl.sell.strike, losingOptType);
+    const newLosingBuy   = buildKiteSymbol(trade.index, trade.expiry, losingRepl.buy.strike,  losingOptType);
+    if (losingSide === "call") { cacheAndSubscribe(newLosingSell, losingRepl.sell.callKey); cacheAndSubscribe(newLosingBuy, losingRepl.buy.callKey); }
+    else                       { cacheAndSubscribe(newLosingSell, losingRepl.sell.putKey);  cacheAndSubscribe(newLosingBuy, losingRepl.buy.putKey);  }
+    const losingOrders   = await enterSpread(newLosingSell, newLosingBuy, trade.quantity, trade.index);
+    const newLosingEntry = losingOrders.actualNet;
+
+    // Fresh profit side
+    const profitRepl     = findReplacementSpread(strikes, spot, trade.index, profitSide);
+    const profitOptType  = profitSide === "call" ? "CE" : "PE";
+    const newProfitSell  = buildKiteSymbol(trade.index, trade.expiry, profitRepl.sell.strike, profitOptType);
+    const newProfitBuy   = buildKiteSymbol(trade.index, trade.expiry, profitRepl.buy.strike,  profitOptType);
+    if (profitSide === "call") { cacheAndSubscribe(newProfitSell, profitRepl.sell.callKey); cacheAndSubscribe(newProfitBuy, profitRepl.buy.callKey); }
+    else                       { cacheAndSubscribe(newProfitSell, profitRepl.sell.putKey);  cacheAndSubscribe(newProfitBuy, profitRepl.buy.putKey);  }
+    const profitOrders   = await enterSpread(newProfitSell, newProfitBuy, trade.quantity, trade.index);
+    const newProfitEntry = profitOrders.actualNet;
+
+    // Update DB — both sides fresh
+    const upd = {
+      slCount: newSlCount, bufferPremium: 0, postSlFirefightDone: false,
+      slBookedLoss: (trade.slBookedLoss || 0) + slLossBooked,
+      firefightPending: false, firefightSide: null,
+      totalEntryPremium: newLosingEntry + newProfitEntry,
+    };
+    if (losingSide === "call") {
+      upd["symbols.callSell"] = newLosingSell; upd["symbols.callBuy"] = newLosingBuy; upd["callSpreadEntryPremium"] = newLosingEntry;
+      upd["symbols.putSell"]  = newProfitSell; upd["symbols.putBuy"]  = newProfitBuy; upd["putSpreadEntryPremium"]  = newProfitEntry;
+    } else {
+      upd["symbols.putSell"]  = newLosingSell; upd["symbols.putBuy"]  = newLosingBuy; upd["putSpreadEntryPremium"]  = newLosingEntry;
+      upd["symbols.callSell"] = newProfitSell; upd["symbols.callBuy"] = newProfitBuy; upd["callSpreadEntryPremium"] = newProfitEntry;
+    }
+    await ActiveTrade.updateOne({ _id: trade._id }, { $set: upd });
+    await sendCondorAlert(
+      `✅ <b>Both Sides Reset</b> · ${trade.index}\n` +
+      `${profitSide}: SELL ${newProfitSell} / BUY ${newProfitBuy} · Net: ${newProfitEntry.toFixed(2)}\n` +
+      `${losingSide}: SELL ${newLosingSell} / BUY ${newLosingBuy} · Net: ${newLosingEntry.toFixed(2)}\n` +
+      `slCount: ${newSlCount} · Buffer: reset to 0`
+    );
+    condorLog(`✅ BOTH SIDES RESET | slCount=${newSlCount}`, "warn");
+    return;
+  }
+
+  // ── Normal firefight — no SL hit during exit ──────────────────────────────
+  // 2. Fresh chain → find replacement for profit side
+  let replacement, spot, strikes;
+  try {
+    spot        = await getSpotPrice(trade.index);
+    strikes     = await fetchFullOptionChain(trade.index, trade.expiry);
+    replacement = findReplacementSpread(strikes, spot, trade.index, profitSide);
+  } catch (chainErr) {
+    // Fresh entry failed — update to ONE_SIDE so losing side SL still monitored
+    const oneSideType = losingSide === "call" ? "ONE_SIDE_CALL" : "ONE_SIDE_PUT";
+    await ActiveTrade.updateOne({ _id: trade._id }, { $set: {
+      positionType: oneSideType, firefightPending: false, firefightSide: null,
+      bufferPremium: newBuffer,
+      [`symbols.${profitSide}Sell`]: null, [`symbols.${profitSide}Buy`]: null,
+      [`${profitSide}SpreadEntryPremium`]: 0,
+    }});
+    condorLog(`🚨 FF PARTIAL — exited ${profitSide} but no fresh entry: ${chainErr.message}`, "error");
+    await sendCondorAlert(
+      `🚨 <b>FIREFIGHT PARTIAL</b> · ${trade.index}\n` +
+      `✅ Exited ${profitSide} (booked ₹${profitBooked.toFixed(2)})\n` +
+      `❌ No fresh ${profitSide} — ${chainErr.message}\n` +
+      `⚠️ Monitoring ${losingSide} only · SL = ${slLevel(losingEntry, newBuffer).toFixed(2)}`
+    );
+    return;
+  }
 
   // actual premium received on exit = what we paid to close sell leg (buyBack) minus what we received to close buy leg (sellClose)
   // net cost to close = exitResult.buyBackAvg - exitResult.sellCloseAvg
@@ -1412,6 +1537,22 @@ const _checkConditions = async (trade) => {
 
   if (callLosing || putLosing) {
     const profitSide = callLosing ? "put" : "call";
+    const losingSide = callLosing ? "call" : "put";
+
+    // ✅ FIX: If losing side has ALSO hit SL simultaneously — SL takes priority.
+    // executeFirefight() also checks this internally, but checking here first
+    // means we go directly to SL reset without even starting FF exit.
+    const callSLCheck = hasCall ? slLevel(callEntry, buffer) : Infinity;
+    const putSLCheck  = hasPut  ? slLevel(putEntry,  buffer) : Infinity;
+    const losingSLHit = losingSide === "call"
+      ? (hasCall && callNet >= callSLCheck)
+      : (hasPut  && putNet  >= putSLCheck);
+
+    if (losingSLHit) {
+      condorLog(`🔴 FF+SL simultaneous | SL takes priority | resetting ${losingSide}`, "error");
+      await executeSLReset(trade, losingSide);
+      return;
+    }
 
     if (trade.mode === "FULL_AUTO") {
       await executeFirefight(trade, profitSide);
@@ -1608,8 +1749,10 @@ export const reconcileKitePositions = async () => {
     }
 
     // ── Job 2: no active trade — check for manual positions in Kite ───────
-    // Skip in paper mode — no real positions exist in Kite
-    if (!LIVE()) return;
+    // ✅ FIX: Paper mode CAN detect manual positions from Kite.
+    // This allows testing with real live data — you enter manually in Kite,
+    // bot detects and monitors with real prices, but never places orders itself.
+    // Only skip auto-detection if explicitly disabled via PAPER_NO_DETECT=true.
 
     // Only run during market hours to avoid ghost detection
     const now  = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));

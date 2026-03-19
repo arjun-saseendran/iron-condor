@@ -1450,12 +1450,29 @@ const _checkConditions = async (trade) => {
 };
 
 // ─── SCAN & SYNC — every 5 seconds ───────────────────────────────────────────
+// ─── Active trade in-memory cache ────────────────────────────────────────────
+// Avoids MongoDB query on every 1s tick — trade data only changes on SL/FF/entry.
+// Cache refreshes every 5s max or when explicitly invalidated.
+let _cachedTrade   = null;
+let _cacheExpiry   = 0;
+const CACHE_TTL_MS = 5000;
+
+export const invalidateTradeCache = () => { _cachedTrade = null; _cacheExpiry = 0; };
+
+const _getActiveTrade = async () => {
+  const now = Date.now();
+  if (_cachedTrade && now < _cacheExpiry) return _cachedTrade;
+  const ActiveTrade = getActiveTradeModel();
+  _cachedTrade = await ActiveTrade.findOne({ status: "ACTIVE" }).lean();
+  _cacheExpiry = now + CACHE_TTL_MS;
+  return _cachedTrade;
+};
+
 // ─── scanAndSyncOrders ────────────────────────────────────────────────────────
 // Runs every 1 second — uses live WebSocket prices (condorPrices{}) only.
 // No REST calls here — dashboard gets real-time data from Kite WebSocket feed.
 export const scanAndSyncOrders = async () => {
-  const ActiveTrade = getActiveTradeModel();
-  const trade = await ActiveTrade.findOne({ status: "ACTIVE" });
+  const trade = await _getActiveTrade();
   if (!trade) return;
 
   const hasCall    = !!(trade.symbols.callSell && trade.symbols.callBuy && trade.callSpreadEntryPremium > 0);

@@ -111,8 +111,8 @@ const SPREAD = {
 };
 
 const MIN_PREMIUM = {
-  NIFTY:  () => parseFloat(process.env.NIFTY_MIN_PREMIUM  || "5"),
-  SENSEX: () => parseFloat(process.env.SENSEX_MIN_PREMIUM || "16"),
+  NIFTY:  () => parseFloat(process.env.NIFTY_MIN_PREMIUM  || "4.4"),
+  SENSEX: () => parseFloat(process.env.SENSEX_MIN_PREMIUM || "14.4"),
 };
 
 const STRIKE_INTERVAL = { NIFTY: 50, SENSEX: 100 };

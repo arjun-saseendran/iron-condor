@@ -13,10 +13,11 @@ const router = express.Router();
 // ✅ FIX: read multipliers from .env — same source as ironCondorEngine.
 //         Previously hardcoded (* 4, * 3, * 0.30) so dashboard showed wrong
 //         SL/FF levels if .env values were tuned.
-const SL_MULT       = () => parseFloat(process.env.SL_MULTIPLIER      || "4");
-const FF_LOSS_MULT  = () => parseFloat(process.env.FF_LOSS_MULTIPLIER  || "3");
-const FF_PROFIT_THR = () => parseFloat(process.env.FF_PROFIT_THRESHOLD || "0.30");
-const BF_SL_MULT    = () => parseFloat(process.env.BF_SL_MULTIPLIER    || "3");
+const SL_MULT         = () => parseFloat(process.env.SL_MULTIPLIER        || "4");
+const FF_LOSS_MULT    = () => parseFloat(process.env.FF_LOSS_MULTIPLIER    || "3");
+const FF_PROFIT_THR   = () => parseFloat(process.env.FF_PROFIT_THRESHOLD   || "0.30");
+const BF_SL_MULT      = () => parseFloat(process.env.BF_SL_MULTIPLIER      || "3");
+const PROFIT_LOCK_THR = () => parseFloat(process.env.PROFIT_LOCK_THRESHOLD || "0.20");
 
 // GET /api/condor/positions
 router.get("/positions", async (req, res) => {
@@ -76,6 +77,8 @@ router.get("/positions", async (req, res) => {
       butterflyPending:    trade.butterflyPending,
       postSlFirefightDone: trade.postSlFirefightDone || false,
       slBookedLoss:        slLoss.toFixed(2),
+      profitLockPending:   trade.profitLockPending   || false,
+      profitLockSide:      trade.profitLockSide      || null,
       call: {
         sellSymbol:  trade.symbols.callSell,
         buySymbol:   trade.symbols.callBuy,
@@ -84,6 +87,7 @@ router.get("/positions", async (req, res) => {
         sl:          (callEntry * SL_MULT() + buffer).toFixed(2),
         ff3x:        (callEntry * FF_LOSS_MULT()).toFixed(2),
         ffProfit:    (callEntry * FF_PROFIT_THR()).toFixed(2),
+        profitLock:  (callEntry * PROFIT_LOCK_THR()).toFixed(2),
       },
       put: {
         sellSymbol:  trade.symbols.putSell,
@@ -93,6 +97,7 @@ router.get("/positions", async (req, res) => {
         sl:          (putEntry * SL_MULT() + buffer).toFixed(2),
         ff3x:        (putEntry * FF_LOSS_MULT()).toFixed(2),
         ffProfit:    (putEntry * FF_PROFIT_THR()).toFixed(2),
+        profitLock:  (putEntry * PROFIT_LOCK_THR()).toFixed(2),
       },
       butterflySL: trade.isIronButterfly
         ? (totalEntry * BF_SL_MULT() + buffer).toFixed(2)

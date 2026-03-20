@@ -1,6 +1,5 @@
 // ─── Kite Market Data ─────────────────────────────────────────────────────────
 // Option chain and LTP data using Kite REST API.
-// Replaces upstoxConfig.js — all market data now from Kite only.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import "dotenv/config";

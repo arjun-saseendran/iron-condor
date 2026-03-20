@@ -150,14 +150,19 @@ export const getKitePnL = (trade) => {
 };
 
 // ─── SL / firefight level calculators ────────────────────────────────────────
-const SL_MULT       = () => parseFloat(process.env.SL_MULTIPLIER       || "4");
-const FF_LOSS_MULT  = () => parseFloat(process.env.FF_LOSS_MULTIPLIER   || "3");
-const FF_PROFIT_THR = () => parseFloat(process.env.FF_PROFIT_THRESHOLD  || "0.30");
-const BF_SL_MULT    = () => parseFloat(process.env.BF_SL_MULTIPLIER     || "5");
+const SL_MULT            = () => parseFloat(process.env.SL_MULTIPLIER            || "4");
+const FF_LOSS_MULT       = () => parseFloat(process.env.FF_LOSS_MULTIPLIER        || "3");
+const FF_PROFIT_THR      = () => parseFloat(process.env.FF_PROFIT_THRESHOLD       || "0.30");
+const BF_SL_MULT         = () => parseFloat(process.env.BF_SL_MULTIPLIER          || "5");
+// Profit-lock threshold: when a spread loses 80% of its value (net ≤ entry × 0.20),
+// it has captured 80% of max profit. If the other side is simultaneously in ANY loss,
+// exit the profit side and enter a fresh spread at min premium to keep earning.
+const PROFIT_LOCK_THR    = () => parseFloat(process.env.PROFIT_LOCK_THRESHOLD     || "0.20");
 
 const slLevel              = (entry, buffer) => entry * SL_MULT()       + buffer;
 const firefightLossLevel   = (entry)         => entry * FF_LOSS_MULT();
 const firefightProfitLevel = (entry)         => entry * FF_PROFIT_THR();
+const profitLockLevel      = (entry)         => entry * PROFIT_LOCK_THR();  // 80% profit captured
 const butterflySLLevel     = (losingEntry, newEntry, buffer) => (losingEntry * BF_SL_MULT()) + newEntry + buffer;
 
 // Max possible loss on the iron condor position:
@@ -992,6 +997,10 @@ export const executeFirefight = async (trade, profitSide) => {
     bufferPremium:    newBuffer,
     firefightPending: false,
     firefightSide:    null,
+    // Reset profit-lock guard for the re-entered side so the new spread can be locked later
+    [`profitLockDone_${profitSide}`]: false,
+    profitLockPending: false,
+    profitLockSide:    null,
     totalEntryPremium:
       (profitSide === "call" ? newEntry                       : trade.callSpreadEntryPremium) +
       (profitSide === "put"  ? newEntry                       : trade.putSpreadEntryPremium),
@@ -1130,6 +1139,10 @@ ${losingSide} spread exit failed: ${e.message}
     bufferPremium:       0,
     postSlFirefightDone: false,
     slBookedLoss:        prevBookedLoss + slLossThisSide,
+    // Reset profit-lock guard for the re-entered losing side + clear any pending lock state
+    [`profitLockDone_${losingSide}`]: false,
+    profitLockPending: false,
+    profitLockSide:    null,
     totalEntryPremium:
       (losingSide === "call" ? newEntry : trade.callSpreadEntryPremium) +
       (losingSide === "put"  ? newEntry : trade.putSpreadEntryPremium),
@@ -1283,6 +1296,118 @@ onPriceUpdate(async (instrumentToken, ltp) => {
     _actionInProgress = false;
   }
 });
+
+// ─── PROFIT LOCK ─────────────────────────────────────────────────────────────
+// Triggered when the PROFIT side has captured 80% of its max gain
+// (net ≤ entry × 0.20) AND the other side is in ANY loss (net > entry).
+//
+// Action:
+//   1. Exit the profit side (book the 80%+ gain as buffer).
+//   2. Enter a fresh spread on the same side at min premium.
+//   3. Keep the losing side open — its SL is unaffected.
+//
+// This differs from a full firefight (which requires the losing side to reach 3×
+// loss). Here we act proactively: the profit side is nearly worthless anyway, so
+// rolling it to a fresh OTM position costs almost nothing and resets the edge.
+//
+// Guard: profitLockDone flag (per-side) prevents re-triggering on the same spread.
+// Flag resets to false when a new spread is entered on that side (FF / SL reset).
+export const executeProfitLock = async (trade, profitSide) => {
+  const ActiveTrade = getActiveTradeModel();
+
+  const profitEntry   = profitSide === "call" ? trade.callSpreadEntryPremium : trade.putSpreadEntryPremium;
+  const profitSellSym = profitSide === "call" ? trade.symbols.callSell       : trade.symbols.putSell;
+  const profitBuySym  = profitSide === "call" ? trade.symbols.callBuy        : trade.symbols.putBuy;
+  const losingSide    = profitSide === "call" ? "put" : "call";
+  const losingEntry   = losingSide === "call" ? trade.callSpreadEntryPremium  : trade.putSpreadEntryPremium;
+  const buffer        = trade.bufferPremium || 0;
+
+  condorLog(`💰 PROFIT LOCK | ${profitSide} hit 80% profit — exiting and re-entering at min premium`, "warn");
+
+  // 1. Exit profit side — capture actual fill prices for real buffer calc
+  const exitResult   = await exitSpreadWithFill(profitSellSym, profitBuySym, trade.quantity, trade.index);
+  const exitNetCost  = Math.max(0, exitResult.buyBackAvg - exitResult.sellCloseAvg);
+  const profitBooked = Math.max(0, profitEntry - exitNetCost);
+  const newBuffer    = buffer + profitBooked;
+
+  console.log(`💰 Profit Lock exit: buyBackAvg=${exitResult.buyBackAvg} sellCloseAvg=${exitResult.sellCloseAvg} booked=${profitBooked.toFixed(2)}`);
+
+  // 2. Find fresh spread at min premium on the same side
+  let replacement, spot, strikes;
+  try {
+    spot        = await getSpotPrice(trade.index);
+    strikes     = await fetchFullOptionChain(trade.index, trade.expiry);
+    replacement = findReplacementSpread(strikes, spot, trade.index, profitSide);
+  } catch (chainErr) {
+    // Fresh entry failed — update to ONE_SIDE_* so losing side SL is still monitored
+    const oneSideType = losingSide === "call" ? "ONE_SIDE_CALL" : "ONE_SIDE_PUT";
+    await ActiveTrade.updateOne({ _id: trade._id }, { $set: {
+      positionType:                     oneSideType,
+      bufferPremium:                    newBuffer,
+      [`profitLockDone_${profitSide}`]: true,
+      [`symbols.${profitSide}Sell`]:    null,
+      [`symbols.${profitSide}Buy`]:     null,
+      [`${profitSide}SpreadEntryPremium`]: 0,
+    }});
+    condorLog(`🚨 PROFIT LOCK PARTIAL — exited ${profitSide} but no fresh entry: ${chainErr.message}`, "error");
+    await sendCondorAlert(
+      `🚨 <b>PROFIT LOCK PARTIAL</b> · ${trade.index}\n` +
+      `✅ Exited ${profitSide} · Booked ₹${profitBooked.toFixed(2)} · Buffer: ₹${newBuffer.toFixed(2)}\n` +
+      `❌ No fresh ${profitSide} spread — ${chainErr.message}\n` +
+      `⚠️ Monitoring ${losingSide} only · SL = ${slLevel(losingEntry, newBuffer).toFixed(2)}`
+    );
+    return;
+  }
+
+  const optType    = profitSide === "call" ? "CE" : "PE";
+  const newSellSym = buildKiteSymbol(trade.index, trade.expiry, replacement.sell.strike, optType);
+  const newBuySym  = buildKiteSymbol(trade.index, trade.expiry, replacement.buy.strike,  optType);
+
+  if (profitSide === "call") {
+    cacheAndSubscribe(newSellSym, replacement.sell.callKey);
+    cacheAndSubscribe(newBuySym,  replacement.buy.callKey);
+  } else {
+    cacheAndSubscribe(newSellSym, replacement.sell.putKey);
+    cacheAndSubscribe(newBuySym,  replacement.buy.putKey);
+  }
+
+  // 3. Enter fresh spread — confirmed from Kite
+  const newOrders = await enterSpread(newSellSym, newBuySym, trade.quantity, trade.index);
+  const newEntry  = newOrders.actualNet;
+
+  // 4. Update DB
+  const newLosingSL = slLevel(losingEntry, newBuffer);
+
+  const upd = {
+    bufferPremium:                    newBuffer,
+    [`profitLockDone_${profitSide}`]: true,   // ← guard: don't re-trigger on same spread
+    totalEntryPremium:
+      (profitSide === "call" ? newEntry                        : trade.callSpreadEntryPremium) +
+      (profitSide === "put"  ? newEntry                        : trade.putSpreadEntryPremium),
+  };
+  if (profitSide === "call") {
+    upd["symbols.callSell"]       = newSellSym;
+    upd["symbols.callBuy"]        = newBuySym;
+    upd["orderIds.callSell"]      = newOrders.sellId;
+    upd["orderIds.callBuy"]       = newOrders.buyId;
+    upd["callSpreadEntryPremium"] = newEntry;
+  } else {
+    upd["symbols.putSell"]        = newSellSym;
+    upd["symbols.putBuy"]         = newBuySym;
+    upd["orderIds.putSell"]       = newOrders.sellId;
+    upd["orderIds.putBuy"]        = newOrders.buyId;
+    upd["putSpreadEntryPremium"]  = newEntry;
+  }
+  await ActiveTrade.updateOne({ _id: trade._id }, { $set: upd });
+
+  await sendCondorAlert(
+    `💰 <b>PROFIT LOCK DONE</b> · ${trade.index}\n` +
+    `Exited ${profitSide} at 80%+ profit · Booked: <b>₹${profitBooked.toFixed(2)}</b> · Buffer: <b>₹${newBuffer.toFixed(2)}</b>\n` +
+    `New ${profitSide}: SELL ${newSellSym} / BUY ${newBuySym} · Net: <b>${newEntry.toFixed(2)}</b>\n` +
+    `${losingSide} SL now: <b>${newLosingSL.toFixed(2)}</b>`
+  );
+  condorLog(`💰 PROFIT LOCK DONE ${trade.index} | new ${profitSide}: ${newSellSym}/${newBuySym} net=${newEntry.toFixed(2)} | buffer=₹${newBuffer.toFixed(2)}`, "success");
+};
 
 // ─── ONE SIDE CHECKER ────────────────────────────────────────────────────────
 // Called when positionType is ONE_SIDE_CALL or ONE_SIDE_PUT.
@@ -1485,6 +1610,80 @@ const _checkConditions = async (trade) => {
     return;
   }
 
+  // ── Profit Lock check ───────────────────────────────────────────────────────
+  // When one side has captured ≥80% of its premium (net ≤ entry × 0.20) AND
+  // the other side is simultaneously in ANY loss (net > its own entry), roll the
+  // profit side to a fresh OTM spread at min premium to keep collecting edge.
+  //
+  // Preconditions:
+  //   • Both sides must be active (hasCall && hasPut)
+  //   • Profit side not already locked this cycle (profitLockDone_<side> flag)
+  //   • Not inside a firefight / butterfly / SL-reset cycle
+  //   • Losing side has NOT yet reached firefight loss level (3×) — if it has,
+  //     the full firefight logic below takes over (it handles both conditions).
+  if (hasCall && hasPut && !trade.isIronButterfly) {
+    const callAt80Profit = callNet <= profitLockLevel(callEntry);
+    const putAt80Profit  = putNet  <= profitLockLevel(putEntry);
+
+    // Call side captured 80% profit AND put side is in loss → lock call profit
+    if (
+      callAt80Profit &&
+      putNet > putEntry &&
+      !trade.profitLockDone_call &&
+      !trade.firefightPending &&
+      // Don't double-act if full firefight condition is already met on put side
+      !(putNet >= firefightLossLevel(putEntry) && callNet <= firefightProfitLevel(callEntry))
+    ) {
+      condorLog(`💰 PROFIT LOCK CHECK | call at 80%+ profit (${callNet.toFixed(2)} ≤ ${profitLockLevel(callEntry).toFixed(2)}) | put in loss (${putNet.toFixed(2)} > ${putEntry.toFixed(2)})`, "warn");
+      if (trade.mode === "FULL_AUTO") {
+        await executeProfitLock(trade, "call");
+      } else {
+        if (!trade.profitLockPending) {
+          await getActiveTradeModel().updateOne({ _id: trade._id }, {
+            $set: { profitLockPending: true, profitLockSide: "call" }
+          });
+          await sendCondorAlert(
+            `💰 <b>PROFIT LOCK ALERT</b> · ${trade.index}\n` +
+            `Call captured 80%+ profit · net=${callNet.toFixed(2)} · entry=${callEntry.toFixed(2)}\n` +
+            `Put in loss: ${putNet.toFixed(2)} > ${putEntry.toFixed(2)}\n` +
+            `Click "Profit Lock" on dashboard to exit call & re-enter at min premium`
+          );
+          condorLog(`💰 PROFIT LOCK ALERT | call 80%+ profit, put in loss | awaiting dashboard action`, "warn");
+        }
+      }
+      return;
+    }
+
+    // Put side captured 80% profit AND call side is in loss → lock put profit
+    if (
+      putAt80Profit &&
+      callNet > callEntry &&
+      !trade.profitLockDone_put &&
+      !trade.firefightPending &&
+      // Don't double-act if full firefight condition is already met on call side
+      !(callNet >= firefightLossLevel(callEntry) && putNet <= firefightProfitLevel(putEntry))
+    ) {
+      condorLog(`💰 PROFIT LOCK CHECK | put at 80%+ profit (${putNet.toFixed(2)} ≤ ${profitLockLevel(putEntry).toFixed(2)}) | call in loss (${callNet.toFixed(2)} > ${callEntry.toFixed(2)})`, "warn");
+      if (trade.mode === "FULL_AUTO") {
+        await executeProfitLock(trade, "put");
+      } else {
+        if (!trade.profitLockPending) {
+          await getActiveTradeModel().updateOne({ _id: trade._id }, {
+            $set: { profitLockPending: true, profitLockSide: "put" }
+          });
+          await sendCondorAlert(
+            `💰 <b>PROFIT LOCK ALERT</b> · ${trade.index}\n` +
+            `Put captured 80%+ profit · net=${putNet.toFixed(2)} · entry=${putEntry.toFixed(2)}\n` +
+            `Call in loss: ${callNet.toFixed(2)} > ${callEntry.toFixed(2)}\n` +
+            `Click "Profit Lock" on dashboard to exit put & re-enter at min premium`
+          );
+          condorLog(`💰 PROFIT LOCK ALERT | put 80%+ profit, call in loss | awaiting dashboard action`, "warn");
+        }
+      }
+      return;
+    }
+  }
+
   // ── Firefight check ─────────────────────────────────────────────────────────
   // ✅ FIX: firefight cross-check was wrong.
   // Original: callLosing used putFFProfit, putLosing used callFFProfit
@@ -1669,6 +1868,8 @@ export const scanAndSyncOrders = async () => {
       butterflyPending:    trade.butterflyPending     || false,
       oppositeSidePending: trade.oppositeSidePending  || false,
       oppositeSide:        trade.oppositeSide         || null,
+      profitLockPending:   trade.profitLockPending    || false,
+      profitLockSide:      trade.profitLockSide       || null,
       positionType:        trade.positionType         || "IRON_CONDOR",
     });
   }

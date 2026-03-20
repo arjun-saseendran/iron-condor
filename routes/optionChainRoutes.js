@@ -1,6 +1,6 @@
 import express from 'express';
-import { getLTP, getLastClose, getPCOptionChain, clearInstrumentCache } from '../config/kiteMarketData.js';
-import { getKiteIndexSymbol, getNextWeeklyExpiry } from '../services/kiteSymbolMapper.js';
+import { getLTP, getLastClose, getPCOptionChain, clearInstrumentCache, getNearestExpiryFromInstruments } from '../config/kiteMarketData.js';
+import { getKiteIndexSymbol } from '../services/kiteSymbolMapper.js';
 
 const router = express.Router();
 
@@ -21,9 +21,12 @@ router.get('/chain', async (req, res) => {
 
   try {
     // ── Expiry ────────────────────────────────────────────────────────────────
-    // ✅ FIX: getNextWeeklyExpiry now returns "YYYY-MM-DD" string (not a Date object).
-    //         .toLocaleDateString() and .toISOString() are Date methods — would throw on a string.
-    const expiryStr   = getNextWeeklyExpiry(symbol);
+    // ✅ FIX: Use actual instrument data to find the nearest expiry instead of
+    //         hardcoding the day-of-week (Thu for SENSEX). BSE/NSE move expiry
+    //         to the previous day on market holidays (e.g. Holi 2026: SENSEX
+    //         moved from Thu Mar 26 → Wed Mar 25). The hardcoded approach always
+    //         missed these and returned zero instruments.
+    const expiryStr   = await getNearestExpiryFromInstruments(symbol);
     const expiryLabel = new Date(expiryStr + "T00:00:00Z").toLocaleDateString('en-IN', {
       weekday: 'short', day: '2-digit', month: 'short', year: 'numeric',
       timeZone: 'Asia/Kolkata',

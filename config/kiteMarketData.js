@@ -98,6 +98,52 @@ const _getInstruments = async (exchange) => {
   }
 };
 
+// ─── Get nearest expiry from actual Kite instruments ─────────────────────────
+// Replaces the hardcoded day-of-week calculation (NIFTY=Tue, SENSEX=Thu).
+// That breaks on market holidays when BSE/NSE moves expiry to the previous day
+// (e.g. Holi 2026: SENSEX expiry moved from Thu Mar 26 → Wed Mar 25).
+// This function fetches the real instrument list and picks the nearest expiry
+// that is >= today in IST.
+export const getNearestExpiryFromInstruments = async (symbol) => {
+  const isSENSEX   = symbol.toUpperCase() === "SENSEX";
+  const exchange   = isSENSEX ? "BFO" : "NFO";
+  const underlying = isSENSEX ? "SENSEX" : "NIFTY";
+
+  const instruments = await _getInstruments(exchange);
+
+  const toDateStr = (expiry) => {
+    if (!expiry) return "";
+    if (expiry instanceof Date) return expiry.toISOString().split("T")[0];
+    if (/^\d{4}-\d{2}-\d{2}$/.test(String(expiry))) return String(expiry);
+    return new Date(expiry).toISOString().split("T")[0];
+  };
+
+  // IST today as "YYYY-MM-DD"
+  const nowIST   = new Date(Date.now() + (5.5 * 60 * 60 * 1000));
+  const todayStr = nowIST.toISOString().split("T")[0];
+
+  // Collect unique expiry dates for this underlying's options, >= today
+  const expiries = [
+    ...new Set(
+      instruments
+        .filter(i =>
+          i.name === underlying &&
+          (i.instrument_type === "CE" || i.instrument_type === "PE")
+        )
+        .map(i => toDateStr(i.expiry))
+        .filter(d => d >= todayStr)
+    ),
+  ].sort();
+
+  if (expiries.length === 0) {
+    console.error(`[EXPIRY] No upcoming expiries found for ${underlying} in ${exchange}`);
+    throw new Error(`No upcoming expiries found for ${underlying} in ${exchange}`);
+  }
+
+  console.log(`[EXPIRY] Nearest expiry for ${underlying}: ${expiries[0]} (from ${expiries.length} available)`);
+  return expiries[0]; // nearest upcoming expiry
+};
+
 export const getPCOptionChain = async (indexSymbol, expiryDate) => {
   try {
     const kc = getKiteInstance();

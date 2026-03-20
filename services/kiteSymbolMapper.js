@@ -36,12 +36,15 @@ export const getKiteIndexSymbol = (symbol) => {
   return INDEX_SYMBOL_MAP[symbol?.toUpperCase()] || `NSE:${symbol}`;
 };
 
-// ─── Next weekly expiry calculator ────────────────────────────────────────────
-// NIFTY  → Tuesday  (day 2)
-// SENSEX → Thursday (day 4)
+// ─── Next weekly expiry calculator (day-of-week fallback) ────────────────────
+// ⚠️  DEPRECATED for option chain and trade entry — use getNearestExpiryFromInstruments()
+//     in kiteMarketData.js instead, which reads the real expiry from Kite instruments
+//     and correctly handles holiday-shifted expiries (e.g. Holi 2026: SENSEX Thu→Wed).
+// This function is kept only for places that cannot do an async instruments call
+// (e.g. quick UI display, symbol builder hints). Do NOT use for actual order entry.
 export const getNextWeeklyExpiry = (symbol) => {
   const upper     = symbol?.toUpperCase();
-  const targetDay = upper === "SENSEX" ? 4 : 2;
+  const targetDay = upper === "SENSEX" ? 4 : 2; // Thu=4, Tue=2 — may be wrong on holidays
 
   const now = new Date();
   const ist = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
@@ -49,10 +52,6 @@ export const getNextWeeklyExpiry = (symbol) => {
   for (let d = 0; d <= 7; d++) {
     const dt = new Date(ist);
     dt.setUTCDate(ist.getUTCDate() + d);
-    // ✅ FIX: return "YYYY-MM-DD" string, not a Date object.
-    //         getNearestExpiry in ironCondorEngine also returns a string.
-    //         Returning a Date here caused symbol-building failures when callers
-    //         passed this result to buildKiteSymbol (which expects a string split on "-").
     if (dt.getUTCDay() === targetDay) return dt.toISOString().split("T")[0];
   }
   return ist.toISOString().split("T")[0];

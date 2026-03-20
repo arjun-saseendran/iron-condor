@@ -28,7 +28,7 @@
 
 import "dotenv/config";
 import { getKiteInstance }               from "../config/kiteConfig.js";
-import { getPCOptionChain, getLTP }      from "../config/kiteMarketData.js";
+import { getPCOptionChain, getLTP, getNearestExpiryFromInstruments } from "../config/kiteMarketData.js";
 import { getIO }                         from "../config/socket.js";
 import { sendCondorAlert }               from "../services/telegramService.js";
 import { buildKiteSymbol, getKiteExchange } from "../services/kiteSymbolBuilder.js";
@@ -212,19 +212,11 @@ export const getSpotPrice = async (index) => {
   throw new Error(`Cannot fetch spot for ${index} (LTP and last-close both unavailable)`);
 };
 
-// Nearest expiry in IST: NIFTY=Tuesday(2), SENSEX=Thursday(4)
-export const getNearestExpiry = (index) => {
-  const targetDay = index === "SENSEX" ? 4 : 2;
-  const now = new Date();
-  const ist = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
-  for (let d = 0; d <= 7; d++) {
-    const dt = new Date(ist);
-    dt.setUTCDate(ist.getUTCDate() + d);
-    if (dt.getUTCDay() === targetDay) {
-      return dt.toISOString().split("T")[0];
-    }
-  }
-  throw new Error(`Cannot find expiry for ${index}`);
+// ✅ FIX: getNearestExpiry now derives the real expiry from actual Kite instruments
+// instead of hardcoding the weekday (NIFTY=Tue, SENSEX=Thu). This correctly
+// handles holiday-shifted expiries (e.g. Holi 2026: SENSEX moved Thu→Wed).
+export const getNearestExpiry = async (index) => {
+  return getNearestExpiryFromInstruments(index);
 };
 
 // ─── Strike selection ─────────────────────────────────────────────────────────

@@ -86,18 +86,26 @@ export const getPCOptionChain = async (indexSymbol, expiryDate) => {
 
     // Filter to options for this underlying + expiry
     const expiryTs = new Date(expiryDate).toISOString().split("T")[0];
+
+    // ✅ FIX: Kite JS client returns inst.expiry as a JS Date object.
+    //         String(date) produces "Thu Mar 26 2026 00:00:00 GMT+0000" — splitting on "T"
+    //         yields "" (empty string before "T" in "GMT") so the comparison always fails.
+    //         Always use .toISOString() when inst.expiry is a Date, or new Date() wrap
+    //         when it's already a string, so comparison is always "YYYY-MM-DD".
+    const toDateStr = (expiry) => {
+      if (expiry instanceof Date) return expiry.toISOString().split("T")[0];
+      // String like "2026-03-26" or "2026-03-26T00:00:00.000Z"
+      return new Date(expiry).toISOString().split("T")[0];
+    };
+
     // ✅ FIX: added parentheses around CE/PE check — without them the || breaks
     //         the && and PE instruments from ANY underlying sneak through,
     //         causing wrong strikes to be selected at entry.
     const options  = instruments.filter(inst =>
       inst.name === underlying &&
-      (inst.instrument_type === "CE" || inst.instrument_type === "PE")
-    ).filter(inst => {
-      const instExpiry = inst.expiry instanceof Date
-        ? inst.expiry.toISOString().split("T")[0]
-        : String(inst.expiry).split("T")[0];
-      return instExpiry === expiryTs;
-    });
+      (inst.instrument_type === "CE" || inst.instrument_type === "PE") &&
+      toDateStr(inst.expiry) === expiryTs
+    );
 
     if (options.length === 0) return null;
 
@@ -168,14 +176,17 @@ export const getOptionInstruments = async (symbol, expiryDate) => {
   const instruments = await _getInstruments(exchange);
   const expiryTs    = new Date(expiryDate).toISOString().split("T")[0];
 
+  // ✅ FIX: same Date-to-string fix as getPCOptionChain
+  const toDateStr = (expiry) => {
+    if (expiry instanceof Date) return expiry.toISOString().split("T")[0];
+    return new Date(expiry).toISOString().split("T")[0];
+  };
+
   return instruments.filter(inst => {
-    const instExpiry = inst.expiry instanceof Date
-      ? inst.expiry.toISOString().split("T")[0]
-      : String(inst.expiry).split("T")[0];
     return (
       inst.name === underlying &&
       (inst.instrument_type === "CE" || inst.instrument_type === "PE") &&
-      instExpiry === expiryTs
+      toDateStr(inst.expiry) === expiryTs
     );
   });
 };

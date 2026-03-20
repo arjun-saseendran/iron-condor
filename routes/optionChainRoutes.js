@@ -91,8 +91,8 @@ router.get('/chain', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Option Chain Error:', error.message);
-    res.status(500).json({ error: 'Failed to fetch option chain' });
+    console.error('❌ Option Chain Error:', error.message, error.stack);
+    res.status(500).json({ error: 'Failed to fetch option chain from Kite', detail: error.message });
   }
 });
 

@@ -1,5 +1,5 @@
 import express from 'express';
-import { getLTP, getLastClose, getPCOptionChain } from '../config/kiteMarketData.js';
+import { getLTP, getLastClose, getPCOptionChain, clearInstrumentCache } from '../config/kiteMarketData.js';
 import { getKiteIndexSymbol, getNextWeeklyExpiry } from '../services/kiteSymbolMapper.js';
 
 const router = express.Router();
@@ -50,9 +50,13 @@ router.get('/chain', async (req, res) => {
     for (let i = -strikeRange; i <= strikeRange; i++) strikes.push(atmStrike + i * step);
 
     // ── Option chain ──────────────────────────────────────────────────────────
+    console.log(`[CHAIN ROUTE] symbol=${symbol} indexKey=${indexKey} expiryStr=${expiryStr}`);
     const pcChain = await getPCOptionChain(indexKey, expiryStr);
     if (!pcChain || pcChain.length === 0) {
-      return res.status(500).json({ error: 'Failed to fetch option chain from Kite' });
+      console.error(`[CHAIN ROUTE] ❌ getPCOptionChain returned null/empty for ${symbol} expiry=${expiryStr}`);
+      return res.status(500).json({
+        error: `No option chain data found for ${symbol} expiry ${expiryStr}. Check server logs for details.`,
+      });
     }
 
     console.log(`✅ [${marketClosed ? 'LAST SESSION' : 'LIVE'}] Kite option chain: ${pcChain.length} strikes for ${symbol}`);
@@ -94,6 +98,15 @@ router.get('/chain', async (req, res) => {
     console.error('❌ Option Chain Error:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to fetch option chain from Kite', detail: error.message });
   }
+});
+
+// GET /api/options/cache-clear?exchange=BFO  (or NFO, or omit for all)
+// Force-busts the in-memory instrument cache so next chain fetch re-downloads from Kite.
+// Use this after deploying a fix without restarting the server.
+router.get('/cache-clear', (req, res) => {
+  const exchange = (req.query.exchange || '').toUpperCase() || null;
+  clearInstrumentCache(exchange || undefined);
+  res.json({ success: true, message: `Instrument cache cleared${exchange ? ' for ' + exchange : ' (all)'}` });
 });
 
 export default router;

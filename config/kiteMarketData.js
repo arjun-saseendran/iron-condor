@@ -57,18 +57,45 @@ const _getMidnightISTTimestamp = () => {
   return midnightIST.getTime();
 };
 
+// ✅ FIX: Export clearInstrumentCache so routes can force-bust the in-memory
+//         cache when a deployment happens mid-session. Also added error logging
+//         so getInstruments() failures are visible in server logs.
+export const clearInstrumentCache = (exchange) => {
+  if (exchange) {
+    delete _instrumentCache[exchange];
+    delete _instrumentCacheTime[exchange];
+    console.log(`[CACHE] Cleared instrument cache for ${exchange}`);
+  } else {
+    Object.keys(_instrumentCache).forEach(k => delete _instrumentCache[k]);
+    Object.keys(_instrumentCacheTime).forEach(k => delete _instrumentCacheTime[k]);
+    console.log(`[CACHE] Cleared ALL instrument caches`);
+  }
+};
+
 const _getInstruments = async (exchange) => {
   const now = Date.now();
   const lastMidnightIST = _getMidnightISTTimestamp();
   // Cache is valid if it was fetched AFTER today's midnight IST
   if (_instrumentCache[exchange] && _instrumentCacheTime[exchange] > lastMidnightIST) {
+    console.log(`[CACHE] Using cached instruments for ${exchange} (${_instrumentCache[exchange].length} records)`);
     return _instrumentCache[exchange];
   }
-  const kc   = getKiteInstance();
-  const data = await kc.getInstruments([exchange]);
-  _instrumentCache[exchange]     = data;
-  _instrumentCacheTime[exchange] = now;
-  return data;
+  const kc = getKiteInstance();
+  console.log(`[CACHE] Fetching fresh instruments for ${exchange} from Kite...`);
+  try {
+    const data = await kc.getInstruments([exchange]);
+    if (!data || data.length === 0) {
+      console.error(`[CACHE] ❌ Kite returned empty instruments for ${exchange}`);
+      throw new Error(`Kite getInstruments("${exchange}") returned empty array`);
+    }
+    console.log(`[CACHE] ✅ Fetched ${data.length} instruments for ${exchange}`);
+    _instrumentCache[exchange]     = data;
+    _instrumentCacheTime[exchange] = now;
+    return data;
+  } catch (err) {
+    console.error(`[CACHE] ❌ getInstruments("${exchange}") failed: ${err.message}`);
+    throw err;
+  }
 };
 
 export const getPCOptionChain = async (indexSymbol, expiryDate) => {
@@ -77,37 +104,64 @@ export const getPCOptionChain = async (indexSymbol, expiryDate) => {
 
     // Determine exchange and underlying name from indexSymbol
     // indexSymbol format expected: "NSE:NIFTY 50" or "BSE:SENSEX"
-    // ✅ FIX: removed unused isNIFTY variable
-    const isSENSEX  = indexSymbol.includes("SENSEX");
-    const exchange  = isSENSEX ? "BFO" : "NFO";
+    const isSENSEX   = indexSymbol.includes("SENSEX");
+    const exchange   = isSENSEX ? "BFO" : "NFO";
     const underlying = isSENSEX ? "SENSEX" : "NIFTY";
 
     const instruments = await _getInstruments(exchange);
 
+    // ── Diagnostics: log raw instrument sample so we can see real expiry format ──
+    const sample = instruments.slice(0, 3);
+    console.log(`[CHAIN] ${exchange} instruments total: ${instruments.length}`);
+    console.log(`[CHAIN] Sample expiry values:`,
+      sample.map(i => ({
+        name: i.name,
+        type: i.instrument_type,
+        expiry: i.expiry,
+        expiryType: typeof i.expiry,
+        isDate: i.expiry instanceof Date,
+        raw: String(i.expiry),
+      }))
+    );
+
     // Filter to options for this underlying + expiry
     const expiryTs = new Date(expiryDate).toISOString().split("T")[0];
+    console.log(`[CHAIN] Looking for: name=${underlying} expiry=${expiryTs}`);
 
     // ✅ FIX: Kite JS client returns inst.expiry as a JS Date object.
     //         String(date) produces "Thu Mar 26 2026 00:00:00 GMT+0000" — splitting on "T"
-    //         yields "" (empty string before "T" in "GMT") so the comparison always fails.
-    //         Always use .toISOString() when inst.expiry is a Date, or new Date() wrap
-    //         when it's already a string, so comparison is always "YYYY-MM-DD".
+    //         yields "" (empty string before "T" in "GMT") so comparison always fails.
+    //         toDateStr() safely handles both Date objects and strings.
     const toDateStr = (expiry) => {
+      if (!expiry) return "";
       if (expiry instanceof Date) return expiry.toISOString().split("T")[0];
-      // String like "2026-03-26" or "2026-03-26T00:00:00.000Z"
+      // Already "YYYY-MM-DD" string
+      if (/^\d{4}-\d{2}-\d{2}$/.test(String(expiry))) return String(expiry);
+      // ISO string or other parseable format
       return new Date(expiry).toISOString().split("T")[0];
     };
 
-    // ✅ FIX: added parentheses around CE/PE check — without them the || breaks
-    //         the && and PE instruments from ANY underlying sneak through,
-    //         causing wrong strikes to be selected at entry.
-    const options  = instruments.filter(inst =>
+    const options = instruments.filter(inst =>
       inst.name === underlying &&
       (inst.instrument_type === "CE" || inst.instrument_type === "PE") &&
       toDateStr(inst.expiry) === expiryTs
     );
 
-    if (options.length === 0) return null;
+    // Log what underlying names actually exist (helps catch "SENSEX" vs "BSE:SENSEX" etc.)
+    if (options.length === 0) {
+      const allNames = [...new Set(instruments.map(i => i.name))].slice(0, 10);
+      const allExpiries = [...new Set(
+        instruments
+          .filter(i => i.name === underlying)
+          .map(i => toDateStr(i.expiry))
+      )].sort().slice(0, 10);
+      console.error(`[CHAIN] ❌ No options found for name="${underlying}" expiry="${expiryTs}"`);
+      console.error(`[CHAIN] Names in ${exchange}:`, allNames);
+      console.error(`[CHAIN] Expiries for "${underlying}":`, allExpiries);
+      return null;
+    }
+
+    console.log(`[CHAIN] ✅ Found ${options.length} options for ${underlying} expiry=${expiryTs}`);
 
     // Group by strike
     const strikeMap = {};

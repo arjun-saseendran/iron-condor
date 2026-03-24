@@ -553,7 +553,7 @@ export const enterIronCondor = async (index, quantity, mode = "SEMI_AUTO", side 
   const existing = await ActiveTrade.findOne({ status: { $in: ["ACTIVE", "EXITING"] } });
   if (existing) throw new Error("Active trade already exists — exit first");
 
-  const expiry  = getNearestExpiry(index);
+  const expiry  = await getNearestExpiry(index);
   const spot    = await getSpotPrice(index);
   const strikes = await fetchFullOptionChain(index, expiry);
   const sel     = selectCondorStrikes(strikes, spot, index);
@@ -658,7 +658,7 @@ export const importTradeFromKite = async (index, quantity, mode = "SEMI_AUTO") =
 
   const kc       = getKiteInstance();
   const exchange = index === "SENSEX" ? "BFO" : "NFO";
-  const expiry   = getNearestExpiry(index);
+  const expiry   = await getNearestExpiry(index);
 
   // Fetch open positions from Kite
   const positions = await kc.getPositions();
@@ -685,10 +685,10 @@ export const importTradeFromKite = async (index, quantity, mode = "SEMI_AUTO") =
   // Actual entry premiums from Kite avg prices
   // sell avg − buy avg = net premium collected
   const callEntry = (callSell && callBuy)
-    ? Math.max(0, callSell.sell_value / Math.abs(callSell.quantity) - callBuy.buy_value / callBuy.quantity)
+    ? Math.max(0, (callSell.average_price || 0) - (callBuy.average_price || 0))
     : 0;
   const putEntry = (putSell && putBuy)
-    ? Math.max(0, putSell.sell_value / Math.abs(putSell.quantity) - putBuy.buy_value / putBuy.quantity)
+    ? Math.max(0, (putSell.average_price || 0) - (putBuy.average_price || 0))
     : 0;
   const totalEntry = callEntry + putEntry;
 
@@ -713,10 +713,17 @@ export const importTradeFromKite = async (index, quantity, mode = "SEMI_AUTO") =
     if (putBuy)   cacheAndSubscribe(putBuy.tradingsymbol,   findToken(putBuy.tradingsymbol));
   }
 
+  const hasCallSpread2 = !!(callSell && callBuy);
+  const hasPutSpread2  = !!(putSell  && putBuy);
+  const positionType   = hasCallSpread2 && hasPutSpread2 ? "IRON_CONDOR"
+                       : hasCallSpread2                  ? "ONE_SIDE_CALL"
+                       :                                   "ONE_SIDE_PUT";
+
   const trade = await ActiveTrade.create({
     index,
     status:   "ACTIVE",
     mode,
+    positionType,
     symbols: {
       callSell: callSell?.tradingsymbol || null,
       callBuy:  callBuy?.tradingsymbol  || null,
@@ -1945,11 +1952,14 @@ export const reconcileKitePositions = async () => {
     // This allows testing with real live data — you enter manually in Kite,
     // bot detects and monitors with real prices, but never places orders itself.
     // Only skip auto-detection if explicitly disabled via PAPER_NO_DETECT=true.
+    if (process.env.LIVE_TRADING !== "true" && process.env.PAPER_NO_DETECT === "true") return;
 
     // Only run during market hours to avoid ghost detection
     const now  = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
     const mins = now.getHours() * 60 + now.getMinutes();
-    const isMarketHours = now.getDay() >= 1 && now.getDay() <= 5 && mins >= 555 && mins < 930;
+    // ✅ FIX: Start at 9:00 (540) not 9:15 (555) — manual positions entered pre-open
+    //         would be missed if reconcile runs between 9:00–9:15 before gap-open window.
+    const isMarketHours = now.getDay() >= 1 && now.getDay() <= 5 && mins >= 540 && mins < 930;
     if (!isMarketHours) return;
 
     // Find open option legs across both exchanges
@@ -1961,6 +1971,12 @@ export const reconcileKitePositions = async () => {
     // Determine index from exchange
     const hasBFO = openLegs.some(p => p.exchange === "BFO");
     const hasNFO = openLegs.some(p => p.exchange === "NFO");
+
+    // ✅ FIX: Warn if both exchanges found — SENSEX takes priority but NIFTY is not silently dropped
+    if (hasBFO && hasNFO) {
+      console.warn("⚠️ Both BFO (SENSEX) and NFO (NIFTY) positions found — detecting SENSEX only this cycle. Check NIFTY positions manually if needed.");
+      condorLog("⚠️ Both SENSEX and NIFTY open positions found — auto-detecting SENSEX only. Verify NIFTY in Kite.", "warn");
+    }
 
     // Handle one index at a time — if both found take SENSEX first (BFO)
     const exchange = hasBFO ? "BFO" : "NFO";
@@ -1986,10 +2002,10 @@ export const reconcileKitePositions = async () => {
 
     // Entry premiums from actual Kite avg prices
     const callEntry = hasCallSpread
-      ? Math.max(0, callSell.sell_value / Math.abs(callSell.quantity) - callBuy.buy_value / callBuy.quantity)
+      ? Math.max(0, (callSell.average_price || 0) - (callBuy.average_price || 0))
       : 0;
     const putEntry = hasPutSpread
-      ? Math.max(0, putSell.sell_value / Math.abs(putSell.quantity) - putBuy.buy_value / putBuy.quantity)
+      ? Math.max(0, (putSell.average_price || 0) - (putBuy.average_price || 0))
       : 0;
 
     // positionType based on what was found
@@ -2025,7 +2041,7 @@ export const reconcileKitePositions = async () => {
       if (putBuy)   cacheAndSubscribe(putBuy.tradingsymbol,   findToken(putBuy.tradingsymbol));
     }
 
-    const expiry = getNearestExpiry(index);
+    const expiry = await getNearestExpiry(index);
     const mode   = process.env.DEFAULT_MODE || "SEMI_AUTO";
 
     await ActiveTrade.create({

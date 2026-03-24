@@ -95,11 +95,11 @@ const pastGapOpenWindow = (h, m) => h > 9 || (h === 9 && m > 25);
 //   SENSEX: Wednesday + Thursday
 // Holiday shifts handled automatically — expiry day derived from getNearestExpiry.
 // Override via NIFTY_ENTRY_DATE_OVERRIDE / SENSEX_ENTRY_DATE_OVERRIDE in .env.
-const isEntryDay = (index, date, day) => {
+const isEntryDay = async (index, date, day) => {
   const override = process.env[`${index}_ENTRY_DATE_OVERRIDE`];
   if (override) return date === override;
 
-  const expiryDate = getNearestExpiry(index);                         // "YYYY-MM-DD"
+  const expiryDate = await getNearestExpiry(index);                   // "YYYY-MM-DD"
   const expiryDay  = new Date(expiryDate + "T00:00:00Z").getUTCDay(); // 0–6
 
   // One trading day before expiry; wrap Monday (1) back to Friday (5)
@@ -262,7 +262,7 @@ export const autoEnterIfNeeded = async () => {
   for (const { index, enabled, lotSize } of indexConfig) {
     if (!enabled) continue;
 
-    if (!isEntryDay(index, date, day)) {
+    if (!await isEntryDay(index, date, day)) {
       if (_waitingLogDate !== date) {
         _waitingLogDate = date;
         condorLog(`⏳ Auto armed | ${index} | today (day=${day}) is not entry day — waiting`, "info");
